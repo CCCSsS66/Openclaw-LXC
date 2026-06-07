@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: ""
+        description: "版本号，例如 v1.0.0；留空自动生成日期版本"
         required: false
         type: string
 
@@ -71,6 +71,9 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Prepare version
         id: vars
         shell: bash
@@ -178,21 +181,16 @@ jobs:
             printf '%q' "$1"
           }
 
-          on_error() {
-            local line="$1"
-            echo
-            echo "=================================================="
-            echo "构建失败，出错行：${line}"
-            echo "正在清理挂载点..."
-            echo "=================================================="
-            cleanup_mounts || true
-            exit 1
+          require_root() {
+            if [ "$(id -u)" != "0" ]; then
+              die "构建脚本必须以 root 运行。GitHub Actions 中请使用：sudo -E bash /tmp/build-openclaw-lxc-ci.sh"
+            fi
           }
 
           cleanup_mounts() {
             set +e
 
-            if [ -d "$ROOTFS" ]; then
+            if [ -n "${ROOTFS:-}" ] && [ -d "$ROOTFS" ]; then
               mountpoint -q "$ROOTFS/proc" && umount -lf "$ROOTFS/proc"
               mountpoint -q "$ROOTFS/sys" && umount -lf "$ROOTFS/sys"
               mountpoint -q "$ROOTFS/dev/pts" && umount -lf "$ROOTFS/dev/pts"
@@ -202,11 +200,29 @@ jobs:
             set -e
           }
 
+          on_error() {
+            local line="$1"
+
+            echo
+            echo "=================================================="
+            echo "构建失败，出错行：${line}"
+            echo "正在清理挂载点..."
+            echo "=================================================="
+
+            cleanup_mounts || true
+
+            echo
+            echo "挂载点状态："
+            mount | grep "$ROOTFS" || true
+
+            exit 1
+          }
+
           install_build_deps() {
             log "[1/12] 安装构建依赖"
 
-            sudo apt-get update
-            sudo apt-get install -y \
+            apt-get update
+            apt-get install -y \
               debootstrap \
               tar \
               gzip \
@@ -224,36 +240,36 @@ jobs:
 
             cleanup_mounts || true
 
-            sudo rm -rf "$WORK_DIR"
+            rm -rf "$WORK_DIR"
             mkdir -p "$ROOTFS" "$DIST_DIR"
 
-            sudo debootstrap \
+            debootstrap \
               --arch="$ARCH" \
               "$DEBIAN_RELEASE" \
               "$ROOTFS" \
               "$BUILD_MIRROR"
 
-            sudo cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
+            cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
 
-            sudo mount --bind /dev "$ROOTFS/dev"
-            sudo mount --bind /dev/pts "$ROOTFS/dev/pts"
-            sudo mount -t proc proc "$ROOTFS/proc"
-            sudo mount -t sysfs sys "$ROOTFS/sys"
+            mount --bind /dev "$ROOTFS/dev"
+            mount --bind /dev/pts "$ROOTFS/dev/pts"
+            mount -t proc proc "$ROOTFS/proc"
+            mount -t sysfs sys "$ROOTFS/sys"
           }
 
           write_base_system() {
             log "[3/12] 写入基础系统配置"
 
-            sudo tee "$ROOTFS/etc/hostname" >/dev/null <<'EOF'
+            cat > "$ROOTFS/etc/hostname" <<'EOF'
           openclaw
           EOF
 
-            sudo tee "$ROOTFS/etc/hosts" >/dev/null <<'EOF'
+            cat > "$ROOTFS/etc/hosts" <<'EOF'
           127.0.0.1 localhost
           127.0.1.1 openclaw
           EOF
 
-            sudo tee "$ROOTFS/etc/network/interfaces" >/dev/null <<'EOF'
+            cat > "$ROOTFS/etc/network/interfaces" <<'EOF'
           auto lo
           iface lo inet loopback
 
@@ -261,14 +277,14 @@ jobs:
           iface eth0 inet dhcp
           EOF
 
-            sudo mkdir -p "$ROOTFS/etc/openclaw"
+            mkdir -p "$ROOTFS/etc/openclaw"
           }
 
           install_openclaw() {
             log "[4/12] 在镜像内预装 Node.js / pnpm / OpenClaw"
             log "OpenClaw npm spec: ${OPENCLAW_NPM_SPEC}"
 
-            sudo chroot "$ROOTFS" /usr/bin/env -i \
+            chroot "$ROOTFS" /usr/bin/env -i \
               HOME=/root \
               TERM=xterm \
               PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -350,13 +366,13 @@ jobs:
           switch_sources() {
             log "[5/12] 切换模板内国内源"
 
-            sudo tee "$ROOTFS/etc/apt/sources.list" >/dev/null <<EOF
+            cat > "$ROOTFS/etc/apt/sources.list" <<EOF
           deb ${CN_APT_MIRROR} bookworm main contrib non-free non-free-firmware
           deb ${CN_APT_MIRROR} bookworm-updates main contrib non-free non-free-firmware
           deb ${CN_SECURITY_MIRROR} bookworm-security main contrib non-free non-free-firmware
           EOF
 
-            sudo chroot "$ROOTFS" /usr/bin/env -i \
+            chroot "$ROOTFS" /usr/bin/env -i \
               HOME=/root \
               TERM=xterm \
               PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -382,15 +398,15 @@ jobs:
               echo "OPENCLAW_RUN_CMD=$(q "$OPENCLAW_RUN_CMD")"
               echo "ENABLE_IPV6_DEFAULT=$(q "$IPV6_POLICY")"
               echo "OPENCLAW_BIND_HOST=$(q "$BIND_HOST")"
-            } | sudo tee "$ROOTFS/etc/openclaw/template.conf" >/dev/null
+            } > "$ROOTFS/etc/openclaw/template.conf"
 
-            sudo chmod 644 "$ROOTFS/etc/openclaw/template.conf"
+            chmod 644 "$ROOTFS/etc/openclaw/template.conf"
           }
 
           write_ipv6_control() {
             log "[7/12] 写入 IPv6 控制脚本"
 
-            sudo tee "$ROOTFS/usr/local/bin/openclaw-ipv6-control" >/dev/null <<'EOF'
+            cat > "$ROOTFS/usr/local/bin/openclaw-ipv6-control" <<'EOF'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
@@ -502,13 +518,13 @@ jobs:
           esac
           EOF
 
-            sudo chmod +x "$ROOTFS/usr/local/bin/openclaw-ipv6-control"
+            chmod +x "$ROOTFS/usr/local/bin/openclaw-ipv6-control"
           }
 
           write_runtime_scripts() {
             log "[8/12] 写入运行期脚本"
 
-            sudo tee "$ROOTFS/usr/local/bin/openclaw-get-addresses" >/dev/null <<'EOF'
+            cat > "$ROOTFS/usr/local/bin/openclaw-get-addresses" <<'EOF'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
@@ -566,9 +582,9 @@ jobs:
           fi
           EOF
 
-            sudo chmod +x "$ROOTFS/usr/local/bin/openclaw-get-addresses"
+            chmod +x "$ROOTFS/usr/local/bin/openclaw-get-addresses"
 
-            sudo tee "$ROOTFS/usr/local/bin/openclaw-wait-network" >/dev/null <<'EOF'
+            cat > "$ROOTFS/usr/local/bin/openclaw-wait-network" <<'EOF'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
@@ -587,9 +603,9 @@ jobs:
           exit 0
           EOF
 
-            sudo chmod +x "$ROOTFS/usr/local/bin/openclaw-wait-network"
+            chmod +x "$ROOTFS/usr/local/bin/openclaw-wait-network"
 
-            sudo tee "$ROOTFS/usr/local/bin/openclaw-set-api" >/dev/null <<'EOF'
+            cat > "$ROOTFS/usr/local/bin/openclaw-set-api" <<'EOF'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
@@ -679,9 +695,9 @@ jobs:
           cat "$INFO"
           EOF
 
-            sudo chmod +x "$ROOTFS/usr/local/bin/openclaw-set-api"
+            chmod +x "$ROOTFS/usr/local/bin/openclaw-set-api"
 
-            sudo tee "$ROOTFS/usr/local/bin/openclaw-firstboot" >/dev/null <<'EOF'
+            cat > "$ROOTFS/usr/local/bin/openclaw-firstboot" <<'EOF'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
@@ -777,9 +793,9 @@ jobs:
           cat "$INFO"
           EOF
 
-            sudo chmod +x "$ROOTFS/usr/local/bin/openclaw-firstboot"
+            chmod +x "$ROOTFS/usr/local/bin/openclaw-firstboot"
 
-            sudo tee "$ROOTFS/usr/local/bin/openclaw-ipv6-ask" >/dev/null <<'EOF'
+            cat > "$ROOTFS/usr/local/bin/openclaw-ipv6-ask" <<'EOF'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
@@ -852,9 +868,9 @@ jobs:
           fi
           EOF
 
-            sudo chmod +x "$ROOTFS/usr/local/bin/openclaw-ipv6-ask"
+            chmod +x "$ROOTFS/usr/local/bin/openclaw-ipv6-ask"
 
-            sudo tee "$ROOTFS/usr/local/bin/openclaw-launcher" >/dev/null <<'EOF'
+            cat > "$ROOTFS/usr/local/bin/openclaw-launcher" <<'EOF'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
@@ -874,13 +890,13 @@ jobs:
           exec bash -lc "$OPENCLAW_RUN_CMD"
           EOF
 
-            sudo chmod +x "$ROOTFS/usr/local/bin/openclaw-launcher"
+            chmod +x "$ROOTFS/usr/local/bin/openclaw-launcher"
           }
 
           write_systemd() {
             log "[9/12] 写入 systemd 服务"
 
-            sudo tee "$ROOTFS/etc/systemd/system/openclaw.service" >/dev/null <<'EOF'
+            cat > "$ROOTFS/etc/systemd/system/openclaw.service" <<'EOF'
           [Unit]
           Description=OpenClaw Service
           After=network-online.target
@@ -900,7 +916,7 @@ jobs:
           WantedBy=multi-user.target
           EOF
 
-            sudo tee "$ROOTFS/etc/systemd/system/openclaw-firstboot.service" >/dev/null <<'EOF'
+            cat > "$ROOTFS/etc/systemd/system/openclaw-firstboot.service" <<'EOF'
           [Unit]
           Description=OpenClaw First Boot Init
           After=network-online.target
@@ -915,15 +931,15 @@ jobs:
           WantedBy=multi-user.target
           EOF
 
-            sudo mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
+            mkdir -p "$ROOTFS/etc/systemd/system/multi-user.target.wants"
 
-            sudo ln -sf /etc/systemd/system/openclaw-firstboot.service \
+            ln -sf /etc/systemd/system/openclaw-firstboot.service \
               "$ROOTFS/etc/systemd/system/multi-user.target.wants/openclaw-firstboot.service"
 
-            sudo ln -sf /etc/systemd/system/openclaw.service \
+            ln -sf /etc/systemd/system/openclaw.service \
               "$ROOTFS/etc/systemd/system/multi-user.target.wants/openclaw.service"
 
-            sudo tee "$ROOTFS/etc/profile.d/openclaw-info.sh" >/dev/null <<'EOF'
+            cat > "$ROOTFS/etc/profile.d/openclaw-info.sh" <<'EOF'
           #!/usr/bin/env bash
 
           if [ "$(id -u)" = "0" ]; then
@@ -953,7 +969,7 @@ jobs:
           fi
           EOF
 
-            sudo chmod +x "$ROOTFS/etc/profile.d/openclaw-info.sh"
+            chmod +x "$ROOTFS/etc/profile.d/openclaw-info.sh"
           }
 
           self_check() {
@@ -968,12 +984,12 @@ jobs:
             bash -n "$ROOTFS/usr/local/bin/openclaw-launcher"
             bash -n "$ROOTFS/etc/profile.d/openclaw-info.sh"
 
-            sudo chroot "$ROOTFS" /usr/bin/env -i \
+            chroot "$ROOTFS" /usr/bin/env -i \
               HOME=/root \
               PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
               /bin/bash --noprofile --norc -c 'command -v node >/dev/null && command -v npm >/dev/null && command -v pnpm >/dev/null && command -v openclaw >/dev/null'
 
-            sudo chroot "$ROOTFS" /usr/bin/env -i \
+            chroot "$ROOTFS" /usr/bin/env -i \
               HOME=/root \
               PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
               /bin/bash --noprofile --norc -c '[ -d /usr/lib/node_modules/openclaw ] || [ -d /usr/local/lib/node_modules/openclaw ]'
@@ -987,7 +1003,7 @@ jobs:
           pack_image() {
             log "[11/12] 清理 rootfs 并打包"
 
-            sudo chroot "$ROOTFS" /usr/bin/env -i \
+            chroot "$ROOTFS" /usr/bin/env -i \
               HOME=/root \
               PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
               /bin/bash --noprofile --norc -s <<'CHROOT'
@@ -1014,13 +1030,11 @@ jobs:
 
             rm -f "$IMAGE_PATH" "$LIST_FILE" "$SHA_FILE"
 
-            sudo tar --numeric-owner \
+            tar --numeric-owner \
               --xattrs \
               --acls \
               -czf "$IMAGE_PATH" \
               -C "$ROOTFS" .
-
-            sudo chown "$(id -u):$(id -g)" "$IMAGE_PATH"
 
             gzip -t "$IMAGE_PATH"
 
@@ -1076,10 +1090,12 @@ jobs:
           final_cleanup() {
             log "清理构建垃圾，只保留 dist 产物"
             cleanup_mounts || true
-            sudo rm -rf "$WORK_DIR"
+            rm -rf "$WORK_DIR"
           }
 
           main() {
+            require_root
+
             log "=================================================="
             log "OpenClaw LXC CI 构建开始"
             log "=================================================="
@@ -1109,7 +1125,14 @@ jobs:
           BUILDER
 
           chmod +x /tmp/build-openclaw-lxc-ci.sh
-          bash /tmp/build-openclaw-lxc-ci.sh
+
+          # 关键修复：
+          # 整个构建脚本必须以 root 运行。
+          # -E 用来保留 GitHub Actions 传入的环境变量。
+          sudo -E bash /tmp/build-openclaw-lxc-ci.sh
+
+          # 构建脚本用 root 生成 dist，这里把 dist 权限交还给 runner，方便后续 upload/release。
+          sudo chown -R "$USER:$USER" dist
 
       - name: Verify dist
         shell: bash
