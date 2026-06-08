@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ================================
-# OpenClaw KVM Cloud-Init 镜像构建脚本
-# 由 .github/workflows/build-openclaw-kvm.yml 调用
-# 需要 root 运行：sudo -E bash scripts/build-openclaw-kvm.sh
 # ==================================================
+# OpenClaw KVM Cloud-Init 镜像构建脚本
+# 由 .github/workflows/main3.yml 调用
+# 需要 root 运行：sudo -E bash scripts/build-openclaw-kvm.sh
+# ================================
 
 # ---------- 可由环境变量覆盖的配置 ----------
 WORK_DIR="${WORK_DIR:-/tmp/openclaw-build}"
 DIST_DIR="${DIST_DIR:-${GITHUB_WORKSPACE:-$PWD}/dist}"
 PAYLOAD_DIR="${WORK_DIR}/payload"
-OFFLINE_DIR="${WORK_DIR}/offline"
+OFLINE_DIR="${WORK_DIR}/offline"
 
 BASE_IMG="${WORK_DIR}/debian-12-base.qcow2"
 WORK_IMG="${WORK_DIR}/openclaw-kvm.qcow2"
@@ -30,16 +30,16 @@ NPM_INSTALL_REGISTRY="${NPM_INSTALL_REGISTRY:-https://registry.npmjs.org/}"
 NPM_FINAL_REGISTRY="${NPM_FINAL_REGISTRY:-https://registry.npmjs.org/}"
 
 VERSION="${VERSION:-dev}"
-SAFE_VERSION="${SAFE_VERSION:-${VERSION#v}"
+SAFE_VERSION="${SAFE_VERSION:-${VERSION#v}}"
 
-# ---------- 产物路径 ----------
+# ------- 产物路径 ----------
 OUT_QCOW2="${DIST_DIR}/openclaw-kvm-${SAFE_VERSION}.qcow2"
 OUT_XZ="${OUT_QCOW2}.xz"
 OUT_SHA="${DIST_DIR}/openclaw-kvm-${SAFE_VERSION}.sha256"
 OUT_LIST="${DIST_DIR}/openclaw-kvm-${SAFE_VERSION}.filelist.txt"
 OUT_INFO="${DIST_DIR}/openclaw-kvm-${SAFE_VERSION}.buildinfo.txt"
 
-# 供 buildinfo 引用（在 prepare_offline_openclaw 中赋值）
+# 供 buildinfo 引用，在 prepare_offline_openclaw 中赋值
 NODE_FILE=""
 
 # ================================================
@@ -66,7 +66,6 @@ need_root() {
 
 on_error() {
   local line="$1"
-  echo
   echo "================================================="
   echo "构建失败，出错行：${line}"
   echo "=================================================="
@@ -79,10 +78,10 @@ on_error() {
 normalize_disk_size() {
   local raw="${DISK_SIZE:-20G}"
 
-  raw="$(echo "$raw" | tr -d ' ')"
-  raw="$(echo "$raw" | tr '[:lower:]' '[:upper:]')"
+  raw="$(echo "$raw" | tr -d ')"
+  raw="$(echo "$raw" | tr '[:lower:]' '[:uper:]')"
 
-  if [[ "$raw" =~ ^[0-9]+$ ]; then
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
     raw="${raw}G"
   fi
 
@@ -109,9 +108,9 @@ validate_inputs() {
   local pmin="$((10#$PORT_MIN))"
   local pmax="$((10#$PORT_MAX))"
 
-  ( pmin >= 1 && pmin <= 65535 )) || die "port_min 必须在 1-65535"
-  ( pmax >= 1 && pmax <= 65535 )) || die "port_max 必须在 1-65535"
-  ( pmin <= pmax )) || die "port_min 不能大于 port_max"
+  (( pmin >= 1 && pmin <= 65535 )) || die "port_min 必须在 1-65535"
+  (( pmax >= 1 && pmax <= 65535 )) || die "port_max 必须在 1-65535"
+  (( pmin <= pmax ) || die "port_min 不能大于 port_max"
 
   PORT_MIN="$pmin"
   PORT_MAX="$pmax"
@@ -124,7 +123,7 @@ validate_inputs() {
   fi
 }
 
-# ==================================================
+# ================================================
 # [1/12] 安装构建依赖
 # ================================================
 install_deps() {
@@ -146,12 +145,12 @@ install_deps() {
     gzip
 
   # libguestfs 在 GitHub Runner 上需要可读的内核镜像
-  chmod 0644 /boot/vmlinuz-* || true
+  chmod 0644 /bot/vmlinuz-* || true
 }
 
-# ================================
-# [2/12] 下载 Debian 12 Cloud-Init qcow2 镜像
 # ==================================================
+# [2/12] 下载 Debian 12 Cloud-Init qcow2 镜像
+# ==================================
 download_cloud_image() {
   log "[2/12] 下载 Debian 12 Cloud-Init qcow2 镜像"
 
@@ -165,40 +164,41 @@ download_cloud_image() {
   log "基础镜像大小：$(du -h "$BASE_IMG" | awk '{print $1}')"
 }
 
-# ================================
+# ==================================================
 # [3/12] 扩容 qcow2 镜像
-# ==================================
+# ================================
 resize_image() {
   log "[3/12] 扩容 qcow2 镜像"
   log "规范化后的磁盘大小：${DISK_SIZE}"
 
-  ROOT_PART="$(virt-filesystems -a "$BASE_IMG" --partitions --long --human-readable \
+  local root_part
+  root_part="$(virt-filesystems -a "$BASE_IMG" --partitions --long --human-readable \
     | awk 'NR>1 {print $1}' | head -n1)"
 
-  if [ -z "$ROOT_PART" ]; then
+  if [ -z "$root_part" ]; then
     die "无法检测 Debian cloud 镜像的根分区"
   fi
 
-  log "检测到根分区：${ROOT_PART}"
+  log "检测到根分区：${root_part}"
 
   qemu-img create -f qcow2 "$WORK_IMG" "$DISK_SIZE"
-  virt-resize --expand "$ROOT_PART" "$BASE_IMG" "$WORK_IMG"
+  virt-resize --expand "$root_part" "$BASE_IMG" "$WORK_IMG"
 
   rm -f "$BASE_IMG"
 }
 
-# ================================
+# ==================================================
 # [4/12] 准备 Node.js + OpenClaw 离线包
 # ==================================
 prepare_offline_openclaw() {
   log "[4/12] 准备 Node.js + OpenClaw 离线包"
 
-  NODE_TMP="${WORK_DIR}/node-tmp"
-  NODE_TAR_DIR="${WORK_DIR}/node-official"
-  RUNTIME_ROOT="${OFLINE_DIR}/opt/openclaw-runtime"
-  NODE_ROT="${OFFLINE_DIR}/opt/node"
+  local node_tmp="${WORK_DIR}/node-tmp"
+  local node_tar_dir="${WORK_DIR}/node-official"
+  local runtime_root="${OFFLINE_DIR}/opt/openclaw-runtime"
+  local node_root="${OFFLINE_DIR}/opt/node"
 
-  mkdir -p "$NODE_TMP" "$NODE_TAR_DIR" "$RUNTIME_ROT" "$NODE_ROOT"
+  mkdir -p "$node_tmp" "$node_tar_dir" "$runtime_root" "$node_root"
   mkdir -p "$OFFLINE_DIR/usr/bin"
   mkdir -p "$OFFLINE_DIR/usr/local/bin"
   mkdir -p "$OFFLINE_DIR/etc/openclaw"
@@ -207,64 +207,69 @@ prepare_offline_openclaw() {
 
   log "获取 Node.js 24 官方 Linux x64 包名"
 
-  NODE_SHASUMS="$(curl -fsSL https://nodejs.org/dist/latest-v24.x/SHASUMS256.txt)"
-  NODE_FILE="$(awk '/linux-x64.tar.xz/ {print $2; exit}' << "$NODE_SHASUMS")"
-  NODE_SHA="$(awk -v f="$NODE_FILE" '$2 == f {print $1; exit}' <<< "$NODE_SHASUMS")"
+  local node_shasums
+  node_shasums="$(curl -fsSL https://nodejs.org/dist/latest-v24.x/SHASUMS256.txt)"
 
-  if [ -z "$NODE_FILE" ] || [ -z "$NODE_SHA" ]; then
+  NODE_FILE="$(awk '/linux-x64\.tar\.xz/ {print $2; exit}' <<< "$node_shasums")"
+
+  local node_sha
+  node_sha="$(awk -v f="$NODE_FILE" '$2 == f {print $1; exit}' << "$node_shasums")"
+
+  if [ -z "$NODE_FILE" ] || [ -z "$node_sha" ]; then
     die "无法获取 Node.js 24 linux-x64.tar.xz 文件名或校验值"
   fi
 
   log "Node.js 文件：$NODE_FILE"
 
-  curl -fsSL "https://nodejs.org/dist/latest-v24.x/${NODE_FILE}" -o "${NODE_TMP}/${NODE_FILE}"
+  curl -fsSL "https://nodejs.org/dist/latest-v24.x/${NODE_FILE}" -o "${node_tmp}/${NODE_FILE}"
 
-  echo "${NODE_SHA}  ${NODE_TMP}/${NODE_FILE}" | sha256sum -c -
+  echo "${node_sha}  ${node_tmp}/${NODE_FILE}" | sha256sum -c -
 
-  tar -xJf "${NODE_TMP}/${NODE_FILE}" -C "$NODE_TAR_DIR" --strip-components=1
+  tar -xJf "${node_tmp}/${NODE_FILE}" -C "$node_tar_dir" --strip-components=1
 
-  cp -a "$NODE_TAR_DIR/." "$NODE_ROOT/"
+  cp -a "$node_tar_dir/." "$node_root/"
 
   log "使用官方 Node.js 安装 pnpm 和 OpenClaw 到离线目录"
 
-  "$NODE_TAR_DIR/bin/npm" config set registry "$NPM_INSTAL_REGISTRY"
-  "$NODE_TAR_DIR/bin/npm" config set fund false
-  "$NODE_TAR_DIR/bin/npm" config set audit false
+  "$node_tar_dir/bin/npm" config set registry "$NPM_INSTALL_REGISTRY"
+  "$node_tar_dir/bin/npm" config set fund false
+  "$node_tar_dir/bin/npm" config set audit false
 
-  "$NODE_TAR_DIR/bin/npm" install -g \
-    --prefix "$RUNTIME_ROOT" \
+  "$node_tar_dir/bin/npm" install -g \
+    --prefix "$runtime_root" \
     pnpm \
     "$OPENCLAW_NPM_SPEC"
 
-  if [ ! -d "$RUNTIME_ROOT/lib/node_modules/openclaw" ]; then
+  if [ ! -d "$runtime_root/lib/node_modules/openclaw" ]; then
     die "离线目录中没有 OpenClaw node_modules"
   fi
 
-  if [ ! -x "$RUNTIME_ROOT/bin/openclaw" ]; then
-    die "离线目录中没有可执行文件：$RUNTIME_ROOT/bin/openclaw"
+  if [ ! -x "$runtime_root/bin/openclaw" ]; then
+    die "离线目录中没有可执行文件：$runtime_root/bin/openclaw"
   fi
 
-  cat > "$OFFLINE_DIR/usr/bin/node" <<'EOF'
+  # /usr/bin 包装器，指向 /opt 下的实际运行时
+cat > "$OFFLINE_DIR/usr/bin/node" <<'EOF'
 #!/usr/bin/env bash
 exec /opt/node/bin/node "$@"
 EOF
 
-  cat > "$OFFLINE_DIR/usr/bin/npm" <<'EOF'
+cat > "$OFLINE_DIR/usr/bin/npm" <<'EOF'
 #!/usr/bin/env bash
 exec /opt/node/bin/npm "$@"
 EOF
 
-  cat > "$OFFLINE_DIR/usr/bin/npx" <'EOF'
+cat > "$OFFLINE_DIR/usr/bin/npx" <'EOF'
 #!/usr/bin/env bash
 exec /opt/node/bin/npx "$@"
 EOF
 
-  cat > "$OFFLINE_DIR/usr/bin/pnpm" <<'EOF'
+cat > "$OFLINE_DIR/usr/bin/pnpm" <<'EOF'
 #!/usr/bin/env bash
 exec /opt/openclaw-runtime/bin/pnpm "$@"
 EOF
 
-  cat > "$OFFLINE_DIR/usr/bin/openclaw" <<'EOF'
+cat > "$OFFLINE_DIR/usr/bin/openclaw" <<'EOF'
 #!/usr/bin/env bash
 exec /opt/openclaw-runtime/bin/openclaw "$@"
 EOF
@@ -273,9 +278,9 @@ EOF
     "$OFFLINE_DIR/usr/bin/npm" \
     "$OFFLINE_DIR/usr/bin/npx" \
     "$OFFLINE_DIR/usr/bin/pnpm" \
-    "$OFLINE_DIR/usr/bin/openclaw"
+    "$OFFLINE_DIR/usr/bin/openclaw"
 
-  cat > "$OFFLINE_DIR/usr/local/bin/openclaw-offline-fix" <<'EOF'
+cat > "$OFFLINE_DIR/usr/local/bin/openclaw-offline-fix" <'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -306,17 +311,18 @@ pnpm -v || true
 openclaw --version || true
 EOF
 
-  REG_ESC="$(printf '%s' "$NPM_FINAL_REGISTRY" | sed 's/[\/&]/\\&/g')"
-  sed -i "s/__NPM_FINAL_REGISTRY__/${REG_ESC}/g" "$OFFLINE_DIR/usr/local/bin/openclaw-offline-fix"
+  local reg_esc
+  reg_esc="$(printf '%s' "$NPM_FINAL_REGISTRY" | sed 's/[\/&]/\\&/g')"
+  sed -i "s/__NPM_FINAL_REGISTRY__/${reg_esc}/g" "$OFFLINE_DIR/usr/local/bin/openclaw-offline-fix"
 
-  chmod +x "$OFLINE_DIR/usr/local/bin/openclaw-offline-fix"
+  chmod +x "$OFFLINE_DIR/usr/local/bin/openclaw-offline-fix"
 
   tar -czf "$WORK_DIR/openclaw-offline.tar.gz" -C "$OFFLINE_DIR" .
 
   log "离线包大小：$(du -h "$WORK_DIR/openclaw-offline.tar.gz" | awk '{print $1}')"
 }
 
-# ==================================================
+# ================================================
 # [5/12] 生成 firstboot / API / IPv6 / systemd 脚本
 # ==================================================
 write_payload_files() {
@@ -327,7 +333,7 @@ write_payload_files() {
   mkdir -p "$PAYLOAD_DIR/etc/systemd/system"
   mkdir -p "$PAYLOAD_DIR/etc/profile.d"
 
-  cat > "$PAYLOAD_DIR/etc/openclaw/template.conf" <<EOF
+cat > "$PAYLOAD_DIR/etc/openclaw/template.conf" <<EOF
 PORT_MIN=$(q "$PORT_MIN")
 PORT_MAX=$(q "$PORT_MAX")
 OPENCLAW_RUN_CMD=$(q "$OPENCLAW_RUN_CMD")
@@ -335,7 +341,7 @@ ENABLE_IPV6_DEFAULT=$(q "$IPV6_POLICY")
 OPENCLAW_BIND_HOST=$(q "$BIND_HOST")
 EOF
 
-  cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-get-addresses" <<'EOF'
+cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-get-addresses" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -385,7 +391,7 @@ if [ "$found6" = "0" ]; then
 fi
 EOF
 
-  cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-wait-network" <<'EOF'
+cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-wait-network" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -404,7 +410,7 @@ done
 exit 0
 EOF
 
-  cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-ipv6-control" <<'EOF'
+cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-ipv6-control" <'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -477,7 +483,6 @@ EOT
 status_ipv6() {
   echo "IPv6 全局地址："
   ip -6 addr show scope global || true
-  echo
   echo "IPv6 路由："
   ip -6 route show || true
 }
@@ -493,7 +498,7 @@ case "$ACTION" in
 esac
 EOF
 
-  cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-firstbot" <<'EOF'
+cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-firstboot" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -540,7 +545,7 @@ EOT
 chown root:openclaw "$RUNTIME"
 chmod 640 "$RUNTIME"
 
-cat > /etc/openclaw/openclaw.env <EOT
+cat > /etc/openclaw/openclaw.env <<EOT
 HOST=$(env_quote "$OPENCLAW_BIND_HOST")
 OPENCLAW_HOST=$(env_quote "$OPENCLAW_BIND_HOST")
 PORT=${PORT}
@@ -556,11 +561,11 @@ systemctl daemon-reload
 systemctl enable openclaw >/dev/null 2>&1 || true
 
 {
-  echo "================================================="
+  echo "================================="
   echo " OpenClaw KVM 已初始化"
   echo "=================================================="
   echo
-  openclaw-get-addreses "${PORT}"
+  openclaw-get-addresses "${PORT}"
   echo
   echo "端口：${PORT}"
   echo "用户名：admin"
@@ -583,7 +588,7 @@ touch "$FLAG"
 cat "$INFO"
 EOF
 
-  cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-set-api" <<'EOF'
+cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-set-api" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -592,7 +597,7 @@ RUNTIME="/etc/openclaw/runtime.env"
 INFO="/root/openclaw-info.txt"
 
 env_quote() {
-  printf "%s" "$1" | sed "s/'/'\\\\''/g; 1s/^/'/; \$s/\$/'/"
+  printf "%s" "$1" | sed "s/'\\''/g; 1s/^/'/; \$s/\$/'/"
 }
 
 if [ ! -f "$RUNTIME" ]; then
@@ -603,15 +608,16 @@ fi
 source /etc/openclaw/template.conf
 source "$RUNTIME"
 
+echo
 echo "================================================="
 echo " OpenClaw 自定义 API 配置"
-echo "=================================================="
+echo "================================================="
 echo
 
 read -rp "API base_url，例如 https://api.openai.com/v1 或 https://api.deepseek.com/v1: " BASE_URL
 BASE_URL="${BASE_URL:-https://api.openai.com/v1}"
 
-read -rp "默认模型，例如 gpt-4.1 / deepseek-chat / deepseek-v4-flash: " MODEL
+read -rp "默认模型，例如 gpt-4.1 / depseek-chat: " MODEL
 MODEL="${MODEL:-gpt-4.1}"
 
 read -rsp "请输入 API Key: " API_KEY
@@ -637,9 +643,9 @@ OPENAI_MODEL=$(env_quote "$MODEL")
 ANTHROPIC_BASE_URL=$(env_quote "$BASE_URL")
 ANTHROPIC_API_KEY=$(env_quote "$API_KEY")
 
-DEEPSEK_BASE_URL=$(env_quote "$BASE_URL")
-DEEPSEK_API_KEY=$(env_quote "$API_KEY")
-DEEPSEEK_MODEL=$(env_quote "$MODEL")
+DEEPSEEK_BASE_URL=$(env_quote "$BASE_URL")
+DEEPSEEK_API_KEY=$(env_quote "$API_KEY")
+DEEPSEK_MODEL=$(env_quote "$MODEL")
 EOT
 
 chown root:openclaw "$CONF"
@@ -650,12 +656,11 @@ touch /etc/openclaw/api_configured
 systemctl restart openclaw || true
 
 {
-  echo
   echo "================================="
   echo " OpenClaw KVM 信息"
   echo "=================================================="
   echo
-  openclaw-get-addreses "${OPENCLAW_PORT}"
+  openclaw-get-addresses "${OPENCLAW_PORT}"
   echo
   echo "端口：${OPENCLAW_PORT}"
   echo "用户名：admin"
@@ -668,14 +673,14 @@ systemctl restart openclaw || true
   echo "重新配置 API：openclaw-set-api"
   echo "查看服务：systemctl status openclaw --no-pager -l"
   echo
-  echo "=================================================="
+  echo "================================================="
 } > "$INFO"
 
 chmod 600 "$INFO"
 cat "$INFO"
 EOF
 
-  cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-ipv6-ask" <<'EOF'
+cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-ipv6-ask" <'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -687,9 +692,9 @@ if [ ! -f "$ASK_FLAG" ]; then
 fi
 
 echo
-echo "================================="
-echo " IPv6 配置"
 echo "=================================================="
+echo " IPv6 配置"
+echo "================================================="
 echo "1) 关闭 IPv6，推荐国内 NAT / 路由器频繁下发 IPv6 的环境"
 echo "2) 开启 IPv6"
 echo
@@ -714,26 +719,26 @@ fi
 rm -f "$ASK_FLAG"
 EOF
 
-  cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-launcher" <<'EOF'
+cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-launcher" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 source /etc/openclaw/template.conf
-source /etc/openclaw/openclaw.env 2>/dev/null || true
+source /etc/openclaw.env 2>/dev/null || true
 
 export HOME=/home/openclaw
 export HOST="${OPENCLAW_BIND_HOST:-0.0.0.0}"
 export OPENCLAW_HOST="${OPENCLAW_BIND_HOST:-0.0.0.0}"
 export PORT="${OPENCLAW_PORT:-${PORT:-18789}}"
-export OPENCLAW_PORT="${OPENCLAW_PORT:-${PORT:-18789}}"
+export OPENCLAW_PORT="${OPENCLAW_PORT:-${PORT:-18789}"
 
 cd /var/lib/openclaw
 exec bash -lc "$OPENCLAW_RUN_CMD"
 EOF
 
-  cat > "$PAYLOAD_DIR/etc/systemd/system/openclaw-firstboot.service" <<'EOF'
+cat > "$PAYLOAD_DIR/etc/systemd/system/openclaw-firstboot.service" <'EOF'
 [Unit]
-Description=OpenClaw First Boot Init
+Description=OpenClaw First Bot Init
 After=network-online.target
 Wants=network-online.target
 ConditionPathExists=!/etc/openclaw/firstboot.done
@@ -747,7 +752,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
-  cat > "$PAYLOAD_DIR/etc/systemd/system/openclaw.service" <<'EOF'
+cat > "$PAYLOAD_DIR/etc/systemd/system/openclaw.service" <<'EOF'
 [Unit]
 Description=OpenClaw Service
 After=network-online.target openclaw-firstboot.service
@@ -768,7 +773,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-  cat > "$PAYLOAD_DIR/etc/profile.d/openclaw-info.sh" <<'EOF'
+cat > "$PAYLOAD_DIR/etc/profile.d/openclaw-info.sh" <<'EOF'
 #!/usr/bin/env bash
 
 case "$-" in
@@ -808,7 +813,7 @@ EOF
 
 # ================================
 # [6/12] 注入 OpenClaw 离线包到 qcow2
-# ================================================
+# ================================
 inject_offline_openclaw() {
   log "[6/12] 注入 OpenClaw 离线包到 qcow2"
 
@@ -820,7 +825,7 @@ inject_offline_openclaw() {
 
 # ==================================
 # [7/12] 注入 systemd / firstboot / API / IPv6 脚本
-# ==================================
+# ==================================================
 inject_payload() {
   log "[7/12] 注入 systemd / firstboot / API / IPv6 脚本"
 
@@ -833,7 +838,7 @@ inject_payload() {
     --run-command 'chmod +x /usr/local/bin/openclaw-* /etc/profile.d/openclaw-info.sh'
 }
 
-# ==================================
+# ================================
 # [8/12] 离线运行级检查 + 启用服务
 # ==================================================
 offline_check() {
@@ -880,9 +885,9 @@ export_image() {
   log "最终镜像：$(du -h "$OUT_XZ" | awk '{print $1}')"
 }
 
-# ================================
+# ==================================================
 # [11/12] 生成镜像文件列表
-# ================================
+# ==================================================
 generate_filelist() {
   log "[11/12] 生成镜像文件列表"
 
@@ -891,9 +896,12 @@ generate_filelist() {
 
 # ==================================================
 # [12/12] 写入构建信息
-# ================================
+# ================================================
 write_buildinfo() {
   log "[12/12] 写入构建信息"
+
+  local sha_value
+  sha_value="$(awk '{print $1}' "$OUT_SHA" 2>/dev/null || echo unknown)"
 
   {
     echo "OpenClaw KVM Cloud-Init 镜像"
@@ -909,7 +917,7 @@ write_buildinfo() {
     echo "端口范围：${PORT_MIN}-${PORT_MAX}"
     echo "Node.js：${NODE_FILE:-unknown}"
     echo "镜像文件：$(basename "$OUT_XZ")"
-    echo "SHA256：$(awk '{print $1}' "$OUT_SHA" 2>/dev/null || echo unknown)"
+    echo "SHA256：${sha_value}"
     echo "=================================================="
     echo
     echo "使用提示："
@@ -922,7 +930,7 @@ write_buildinfo() {
   cat "$OUT_INFO"
 }
 
-# ==================================================
+# ==================================
 # 主流程
 # ================================
 main() {
@@ -950,3 +958,4 @@ main() {
 }
 
 main "$@"
+
