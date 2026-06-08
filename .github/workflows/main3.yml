@@ -1,4 +1,4 @@
-name: Build OpenClaw KVM 2
+name: Build OpenClaw KVM
 
 on:
   workflow_dispatch:
@@ -26,7 +26,7 @@ on:
         default: "0.0.0.0"
         type: choice
         options:
-          - "0.0.0.0"
+          - "0.0.0"
           - "::"
 
       ipv6_policy:
@@ -48,7 +48,7 @@ on:
       port_min:
         description: "随机端口最小值"
         required: false
-        default: "20000"
+        default: "2000"
         type: string
 
       port_max:
@@ -89,7 +89,7 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             VERSION="${GITHUB_REF_NAME}"
           else
-            if [[ -n "${INPUT_VERSION}" ]; then
+            if [[ -n "${INPUT_VERSION}" ]]; then
               VERSION="${INPUT_VERSION}"
             else
               VERSION="v$(date -u +'%Y.%m.%d-%H%M')"
@@ -103,7 +103,7 @@ jobs:
 
           SAFE_VERSION="${VERSION#v}"
 
-          echo "version=${VERSION}" > "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "safe_version=${SAFE_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Free up disk space
@@ -114,19 +114,19 @@ jobs:
 
       - name: Build KVM qcow2
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${ steps.version.outputs.version }}
           SAFE_VERSION: ${{ steps.version.outputs.safe_version }}
           OPENCLAW_NPM_SPEC: ${{ inputs.openclaw_npm_spec || 'openclaw' }}
-          OPENCLAW_RUN_CMD: ${{ inputs.openclaw_run_cmd || 'openclaw onboard' }}
-          BIND_HOST: ${{ inputs.bind_host || '0.0.0.0' }
+          OPENCLAW_RUN_CMD: ${ inputs.openclaw_run_cmd || 'openclaw onboard' }}
+          BIND_HOST: ${{ inputs.bind_host || '0.0.0' }}
           IPV6_POLICY: ${{ inputs.ipv6_policy || 'ask' }}
           DISK_SIZE: ${{ inputs.disk_size || '20G' }}
-          PORT_MIN: ${{ inputs.port_min || '20000' }}
-          PORT_MAX: ${{ inputs.port_max || '65000' }}
+          PORT_MIN: ${{ inputs.port_min || '2000' }}
+          PORT_MAX: ${ inputs.port_max || '65000' }}
           NPM_INSTALL_REGISTRY: "https://registry.npmjs.org/"
           NPM_FINAL_REGISTRY: "https://registry.npmjs.org/"
           DIST_DIR: ${{ github.workspace }}/dist
-          WORK_DIR: ${{ runer.temp }}/openclaw-build
+          WORK_DIR: ${{ runner.temp }}/openclaw-build
         run: |
           set -Eeuo pipefail
           chmod +x scripts/build-openclaw-kvm.sh
@@ -140,11 +140,10 @@ jobs:
           if-no-files-found: error
 
       - name: Create GitHub Release
-        if: ${{ github.event_name == 'push' || inputs.version != '' || true }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ steps.version.outputs.version }}
-          PRERELEASE: ${ inputs.prerelease }}
+          PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -Eeuo pipefail
 
@@ -162,4 +161,3 @@ jobs:
               $PRE_FLAG \
               dist/*
           fi
-
