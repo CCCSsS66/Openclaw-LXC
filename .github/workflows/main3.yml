@@ -1,4 +1,4 @@
-name: Build OpenClaw KVM Cloud Image
+name: Build OpenClaw KVM 2
 
 on:
   workflow_dispatch:
