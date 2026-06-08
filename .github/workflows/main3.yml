@@ -1,4 +1,4 @@
-name: Build OpenClaw KVM 2
+name: Build OpenClaw KVM Cloud Image
 
 on:
   workflow_dispatch:
@@ -689,4 +689,603 @@ jobs:
 
           {
             write_shell_kv OPENCLAW_PORT "$PORT"
-            write_s
+            write_shell_kv OPENCLAW_ADMIN_PASSWORD "$ADMIN_PASS"
+            write_shell_kv ENABLE_IPV6 "$ENABLE_IPV6"
+          } > "$RUNTIME"
+
+          chown root:openclaw "$RUNTIME"
+          chmod 640 "$RUNTIME"
+
+          {
+            write_shell_kv HOST "$OPENCLAW_BIND_HOST"
+            write_shell_kv OPENCLAW_HOST "$OPENCLAW_BIND_HOST"
+            write_shell_kv PORT "$PORT"
+            write_shell_kv OPENCLAW_PORT "$PORT"
+            write_shell_kv OPENCLAW_ADMIN_USER "admin"
+            write_shell_kv OPENCLAW_ADMIN_PASSWORD "$ADMIN_PASS"
+          } > /etc/openclaw/openclaw.env
+
+          chown root:openclaw /etc/openclaw/openclaw.env
+          chmod 640 /etc/openclaw/openclaw.env
+
+          systemctl daemon-reload
+          systemctl enable openclaw >/dev/null 2>&1 || true
+
+          {
+            echo
+            echo "=================================================="
+            echo " OpenClaw KVM 已初始化"
+            echo "=================================================="
+            echo
+            openclaw-get-addresses "${PORT}"
+            echo
+            echo "端口：${PORT}"
+            echo "用户名：admin"
+            echo "密码：${ADMIN_PASS}"
+            echo "监听地址：${OPENCLAW_BIND_HOST}"
+            echo
+            if [ "$ENABLE_IPV6" = "1" ]; then
+              echo "IPv6 状态：已开启"
+            else
+              echo "IPv6 状态：已关闭"
+            fi
+            echo
+            echo "下一步：执行 openclaw-set-api 配置模型 API"
+            echo "查看服务：systemctl status openclaw --no-pager -l"
+            echo
+            echo "=================================================="
+          } > "$INFO"
+
+          chmod 600 "$INFO"
+          touch "$FLAG"
+          cat "$INFO"
+          EOF
+
+            cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-set-api" <<'EOF'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          CONF="/etc/openclaw/openclaw.env"
+          RUNTIME="/etc/openclaw/runtime.env"
+          INFO="/root/openclaw-info.txt"
+
+          write_shell_kv() {
+            local key="$1"
+            local val="${2-}"
+            printf '%s=%q\n' "$key" "$val"
+          }
+
+          if [ ! -f "$RUNTIME" ]; then
+            echo "运行时配置不存在，请先执行：openclaw-firstboot"
+            exit 1
+          fi
+
+          source /etc/openclaw/template.conf
+          source "$RUNTIME"
+
+          echo
+          echo "=================================================="
+          echo " OpenClaw 自定义 API 配置"
+          echo "=================================================="
+          echo
+
+          read -rp "API base_url，例如 https://api.openai.com/v1 或 https://api.deepseek.com/v1: " BASE_URL
+          BASE_URL="${BASE_URL:-https://api.openai.com/v1}"
+
+          read -rp "默认模型，例如 gpt-4.1 / deepseek-chat / deepseek-v4-flash: " MODEL
+          MODEL="${MODEL:-gpt-4.1}"
+
+          read -rsp "请输入 API Key: " API_KEY
+          echo
+
+          if [ -z "$API_KEY" ]; then
+            echo "API Key 不能为空"
+            exit 1
+          fi
+
+          {
+            write_shell_kv HOST "$OPENCLAW_BIND_HOST"
+            write_shell_kv OPENCLAW_HOST "$OPENCLAW_BIND_HOST"
+            write_shell_kv PORT "$OPENCLAW_PORT"
+            write_shell_kv OPENCLAW_PORT "$OPENCLAW_PORT"
+            write_shell_kv OPENCLAW_ADMIN_USER "admin"
+            write_shell_kv OPENCLAW_ADMIN_PASSWORD "$OPENCLAW_ADMIN_PASSWORD"
+
+            write_shell_kv OPENAI_BASE_URL "$BASE_URL"
+            write_shell_kv OPENAI_API_KEY "$API_KEY"
+            write_shell_kv OPENAI_MODEL "$MODEL"
+
+            write_shell_kv ANTHROPIC_BASE_URL "$BASE_URL"
+            write_shell_kv ANTHROPIC_API_KEY "$API_KEY"
+
+            write_shell_kv DEEPSEEK_BASE_URL "$BASE_URL"
+            write_shell_kv DEEPSEEK_API_KEY "$API_KEY"
+            write_shell_kv DEEPSEEK_MODEL "$MODEL"
+          } > "$CONF"
+
+          chown root:openclaw "$CONF"
+          chmod 640 "$CONF"
+
+          touch /etc/openclaw/api_configured
+
+          systemctl restart openclaw || true
+
+          {
+            echo
+            echo "=================================================="
+            echo " OpenClaw KVM 信息"
+            echo "=================================================="
+            echo
+            openclaw-get-addresses "${OPENCLAW_PORT}"
+            echo
+            echo "端口：${OPENCLAW_PORT}"
+            echo "用户名：admin"
+            echo "密码：${OPENCLAW_ADMIN_PASSWORD}"
+            echo "监听地址：${OPENCLAW_BIND_HOST}"
+            echo
+            echo "模型接口：${BASE_URL}"
+            echo "默认模型：${MODEL}"
+            echo
+            echo "重新配置 API：openclaw-set-api"
+            echo "查看服务：systemctl status openclaw --no-pager -l"
+            echo
+            echo "=================================================="
+          } > "$INFO"
+
+          chmod 600 "$INFO"
+          cat "$INFO"
+          EOF
+
+            cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-ipv6-ask" <<'EOF'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          ASK_FLAG="/etc/openclaw/ipv6_need_ask"
+          RUNTIME="/etc/openclaw/runtime.env"
+
+          if [ ! -f "$ASK_FLAG" ]; then
+            exit 0
+          fi
+
+          echo
+          echo "=================================================="
+          echo " IPv6 配置"
+          echo "=================================================="
+          echo
+          echo "1) 关闭 IPv6，推荐国内 NAT / 路由器疯狂下发 IPv6 的环境"
+          echo "2) 开启 IPv6"
+          echo
+          read -rp "请选择 [1]: " ip6_choice
+          ip6_choice="${ip6_choice:-1}"
+
+          if [ "$ip6_choice" = "2" ]; then
+            openclaw-ipv6-control enable || true
+            NEW_IPV6="1"
+          else
+            openclaw-ipv6-control disable || true
+            NEW_IPV6="0"
+          fi
+
+          if [ -f "$RUNTIME" ]; then
+            sed -i '/^ENABLE_IPV6=/d' "$RUNTIME"
+            printf 'ENABLE_IPV6=%q\n' "$NEW_IPV6" >> "$RUNTIME"
+            chown root:openclaw "$RUNTIME" || true
+            chmod 640 "$RUNTIME" || true
+          fi
+
+          rm -f "$ASK_FLAG"
+          EOF
+
+            cat > "$PAYLOAD_DIR/usr/local/bin/openclaw-launcher" <<'EOF'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          set -a
+          source /etc/openclaw/template.conf
+          if [ -f /etc/openclaw/openclaw.env ]; then
+            source /etc/openclaw/openclaw.env
+          fi
+          set +a
+
+          export HOME=/home/openclaw
+
+          export HOST="${HOST:-${OPENCLAW_BIND_HOST:-0.0.0.0}}"
+          export OPENCLAW_HOST="${OPENCLAW_HOST:-$HOST}"
+
+          export PORT="${OPENCLAW_PORT:-${PORT:-18789}}"
+          export OPENCLAW_PORT="$PORT"
+
+          cd /var/lib/openclaw
+          exec bash -lc "$OPENCLAW_RUN_CMD"
+          EOF
+
+            cat > "$PAYLOAD_DIR/etc/systemd/system/openclaw-firstboot.service" <<'EOF'
+          [Unit]
+          Description=OpenClaw First Boot Init
+          After=network-online.target
+          Wants=network-online.target
+          ConditionPathExists=!/etc/openclaw/firstboot.done
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/openclaw-firstboot
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+            cat > "$PAYLOAD_DIR/etc/systemd/system/openclaw.service" <<'EOF'
+          [Unit]
+          Description=OpenClaw Service
+          After=network-online.target openclaw-firstboot.service
+          Wants=network-online.target openclaw-firstboot.service
+
+          [Service]
+          Type=simple
+          User=openclaw
+          Group=openclaw
+          WorkingDirectory=/var/lib/openclaw
+          ExecStartPre=+/usr/local/bin/openclaw-firstboot
+          ExecStart=/usr/local/bin/openclaw-launcher
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+            cat > "$PAYLOAD_DIR/etc/profile.d/openclaw-info.sh" <<'EOF'
+          #!/usr/bin/env bash
+
+          _openclaw_profile_interactive=0
+
+          case "$-" in
+            *i*) _openclaw_profile_interactive=1 ;;
+          esac
+
+          if [ "$_openclaw_profile_interactive" = "1" ] \
+            && [ -t 0 ] \
+            && [ -t 1 ] \
+            && [ "$(id -u)" = "0" ]; then
+
+            echo
+
+            if [ -f /etc/openclaw/ipv6_need_ask ]; then
+              openclaw-ipv6-ask
+            fi
+
+            if [ -f /root/openclaw-info.txt ]; then
+              cat /root/openclaw-info.txt
+            else
+              echo "OpenClaw 信息文件不存在。"
+              echo "如果首次启动没有完成，可以执行：openclaw-firstboot"
+            fi
+
+            if [ -f /etc/openclaw/firstboot.done ] && [ ! -f /etc/openclaw/api_configured ]; then
+              echo
+              echo "检测到还没有配置自定义 API。"
+              read -rp "是否现在配置？[Y/n]: " answer
+              answer="${answer:-Y}"
+              if [[ "$answer" =~ ^[Yy]$ ]]; then
+                openclaw-set-api
+              fi
+            fi
+          fi
+
+          unset _openclaw_profile_interactive
+          EOF
+
+            chmod +x "$PAYLOAD_DIR/usr/local/bin/"*
+            chmod +x "$PAYLOAD_DIR/etc/profile.d/openclaw-info.sh"
+          }
+
+          inject_offline_openclaw() {
+            log "[6/12] 注入 OpenClaw 离线包到 qcow2"
+
+            virt-copy-in -a "$IMAGE" "$WORK_DIR/openclaw-offline.tar.gz" /root/
+
+            virt-customize -a "$IMAGE" --no-network \
+              --run-command 'tar -xzf /root/openclaw-offline.tar.gz -C /' \
+              --run-command 'rm -f /root/openclaw-offline.tar.gz' \
+              --run-command '/usr/local/bin/openclaw-offline-fix'
+          }
+
+          inject_payload() {
+            log "[7/12] 注入 systemd / firstboot / API / IPv6 脚本"
+
+            virt-copy-in -a "$IMAGE" "$PAYLOAD_DIR/usr" /
+            virt-copy-in -a "$IMAGE" "$PAYLOAD_DIR/etc" /
+
+            virt-customize -a "$IMAGE" --no-network \
+              --run-command 'chmod 755 /usr/local/bin/openclaw-* || true' \
+              --run-command 'chmod 644 /etc/openclaw/template.conf' \
+              --run-command 'chown -R openclaw:openclaw /var/lib/openclaw /home/openclaw || true' \
+              --run-command 'systemctl enable openclaw-firstboot.service || true' \
+              --run-command 'systemctl enable openclaw.service || true'
+          }
+
+          smoke_test() {
+            log "[8/12] 离线运行级检查"
+
+            virt-customize -a "$IMAGE" --no-network \
+              --run-command 'command -v node' \
+              --run-command 'command -v npm' \
+              --run-command 'command -v pnpm' \
+              --run-command 'command -v openclaw' \
+              --run-command 'openclaw --version || true' \
+              --run-command 'bash -n /usr/local/bin/openclaw-firstboot' \
+              --run-command 'bash -n /usr/local/bin/openclaw-set-api' \
+              --run-command 'bash -n /usr/local/bin/openclaw-ipv6-control' \
+              --run-command 'bash -n /usr/local/bin/openclaw-launcher' \
+              --run-command 'id openclaw' \
+              --run-command 'su -s /bin/bash openclaw -c "test -r /etc/openclaw/template.conf"'
+          }
+
+          cleanup_image() {
+            log "[9/12] 清理镜像缓存和唯一标识"
+
+            virt-customize -a "$IMAGE" --no-network \
+              --run-command 'rm -rf /tmp/* /var/tmp/* || true' \
+              --run-command 'rm -f /root/.bash_history /home/openclaw/.bash_history || true' \
+              --run-command 'truncate -s 0 /etc/machine-id || true' \
+              --run-command 'rm -f /var/lib/dbus/machine-id || true' \
+              --run-command 'rm -f /etc/ssh/ssh_host_* || true' \
+              --run-command 'cloud-init clean --logs --seed || true'
+          }
+
+          export_and_compress() {
+            log "[10/12] 导出并压缩 qcow2"
+
+            rm -f "$OUT_QCOW2" "$OUT_XZ" "$OUT_SHA" "$OUT_LIST"
+
+            qemu-img convert -O qcow2 -c "$IMAGE" "$OUT_QCOW2"
+
+            xz -T0 -9e "$OUT_QCOW2"
+
+            sha256sum "$OUT_XZ" > "$OUT_SHA"
+          }
+
+          generate_file_list() {
+            log "[11/12] 生成镜像文件列表"
+
+            virt-ls -a "$IMAGE" -R / > "$OUT_LIST"
+
+            log "检查 /usr/bin/openclaw"
+            if ! virt-ls -a "$IMAGE" /usr/bin | grep -qx 'openclaw'; then
+              echo "调试：/usr/bin 中的相关文件："
+              virt-ls -a "$IMAGE" /usr/bin | grep -Ei 'openclaw|node|npm|pnpm' || true
+              die "镜像中没有 /usr/bin/openclaw"
+            fi
+
+            log "检查 /opt/openclaw-runtime/lib/node_modules/openclaw"
+            if ! virt-ls -a "$IMAGE" /opt/openclaw-runtime/lib/node_modules | grep -qx 'openclaw'; then
+              echo "调试：/opt/openclaw-runtime/lib/node_modules 内容："
+              virt-ls -a "$IMAGE" /opt/openclaw-runtime/lib/node_modules || true
+              die "镜像中没有 OpenClaw node_modules"
+            fi
+
+            log "检查 openclaw.service"
+            if ! virt-ls -a "$IMAGE" /etc/systemd/system | grep -qx 'openclaw.service'; then
+              echo "调试：/etc/systemd/system 中的 openclaw 文件："
+              virt-ls -a "$IMAGE" /etc/systemd/system | grep -i openclaw || true
+              die "镜像中没有 openclaw.service"
+            fi
+
+            log "检查 openclaw-firstboot"
+            if ! virt-ls -a "$IMAGE" /usr/local/bin | grep -qx 'openclaw-firstboot'; then
+              echo "调试：/usr/local/bin 中的 openclaw 文件："
+              virt-ls -a "$IMAGE" /usr/local/bin | grep -i openclaw || true
+              die "镜像中没有 openclaw-firstboot"
+            fi
+
+            {
+              echo
+              echo "# Verified important files"
+              echo "/usr/bin/openclaw"
+              echo "/opt/openclaw-runtime/lib/node_modules/openclaw"
+              echo "/etc/systemd/system/openclaw.service"
+              echo "/usr/local/bin/openclaw-firstboot"
+            } >> "$OUT_LIST"
+
+            log "文件列表验证通过"
+          }
+
+          write_build_info() {
+            log "[12/12] 写入构建信息"
+
+            {
+              echo "OpenClaw KVM Cloud-Init Image"
+              echo
+              echo "Version: ${VERSION}"
+              echo "Template: ${TEMPLATE_NAME}"
+              echo "Debian cloud image: ${DEBIAN_CLOUD_IMAGE_URL}"
+              echo "Disk size: ${DISK_SIZE}"
+              echo "OpenClaw npm spec: ${OPENCLAW_NPM_SPEC}"
+              echo "OpenClaw run command: ${OPENCLAW_RUN_CMD}"
+              echo "Bind host: ${BIND_HOST}"
+              echo "IPv6 policy: ${IPV6_POLICY}"
+              echo "Port range: ${PORT_MIN}-${PORT_MAX}"
+              echo "Image: $(basename "$OUT_XZ")"
+              echo
+              echo "SHA256:"
+              cat "$OUT_SHA"
+              echo
+              echo "Created at: $(date -u '+%F %T UTC')"
+            } > "$BUILD_INFO"
+
+            rm -rf "$WORK_DIR"
+          }
+
+          main() {
+            need_root
+
+            log "=================================================="
+            log "OpenClaw KVM Cloud Image 构建开始"
+            log "=================================================="
+
+            validate_inputs
+            install_deps
+            download_cloud_image
+            resize_image
+            prepare_offline_openclaw
+            write_payload_files
+            inject_offline_openclaw
+            inject_payload
+            smoke_test
+            cleanup_image
+            export_and_compress
+            generate_file_list
+            write_build_info
+
+            log "=================================================="
+            log "构建完成"
+            log "=================================================="
+
+            ls -lh "$DIST_DIR"
+            cat "$BUILD_INFO"
+          }
+
+          main "$@"
+          BUILDER
+
+          chmod +x /tmp/build-openclaw-kvm.sh
+          sudo -E bash /tmp/build-openclaw-kvm.sh
+          sudo chown -R "$USER:$USER" dist
+
+      - name: Verify dist
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          ls -lah dist
+
+          IMAGE="$(ls -t dist/*.qcow2.xz | head -1)"
+          echo "IMAGE=$IMAGE"
+
+          xz -t "$IMAGE"
+
+          LIST_FILE="$(ls -t dist/*.list | head -1)"
+          echo "LIST_FILE=$LIST_FILE"
+
+          grep -Eq '(^|/)usr/bin/openclaw$|^/usr/bin/openclaw$' "$LIST_FILE"
+          grep -Eq '(^|/)opt/openclaw-runtime/lib/node_modules/openclaw' "$LIST_FILE"
+          grep -Eq '(^|/)etc/systemd/system/openclaw.service$|^/etc/systemd/system/openclaw.service$' "$LIST_FILE"
+          grep -Eq '(^|/)usr/local/bin/openclaw-firstboot$|^/usr/local/bin/openclaw-firstboot$' "$LIST_FILE"
+
+          echo "验证通过。"
+          echo
+          cat dist/build-info.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-kvm-cloud-image-${{ steps.vars.outputs.safe_version }}
+          path: |
+            dist/*.qcow2.xz
+            dist/*.sha256
+            dist/*.list
+            dist/build-info.txt
+          retention-days: 30
+
+      - name: Create release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<EOF
+          # OpenClaw KVM Cloud-Init Image ${{ steps.vars.outputs.version }}
+
+          ## 文件说明
+
+          - \`openclaw-kvm-debian12-${{ steps.vars.outputs.safe_version }}.qcow2.xz\`：KVM / PVE Cloud-Init 镜像
+          - \`.sha256\`：SHA256 校验文件
+          - \`.list\`：镜像内文件列表
+          - \`build-info.txt\`：构建信息
+
+          ## 解压镜像
+
+          \`\`\`bash
+          xz -dk openclaw-kvm-debian12-${{ steps.vars.outputs.safe_version }}.qcow2.xz
+          \`\`\`
+
+          ## PVE 创建 VM 模板示例
+
+          \`\`\`bash
+          qm create 9000 \\
+            --name openclaw-kvm \\
+            --memory 4096 \\
+            --cores 2 \\
+            --net0 virtio,bridge=vmbr0 \\
+            --agent enabled=1
+
+          qm importdisk 9000 openclaw-kvm-debian12-${{ steps.vars.outputs.safe_version }}.qcow2 local-lvm
+
+          qm set 9000 \\
+            --scsihw virtio-scsi-pci \\
+            --scsi0 local-lvm:vm-9000-disk-0 \\
+            --ide2 local-lvm:cloudinit \\
+            --boot c \\
+            --bootdisk scsi0 \\
+            --serial0 socket \\
+            --vga serial0
+
+          qm template 9000
+          \`\`\`
+
+          ## 克隆使用示例
+
+          \`\`\`bash
+          qm clone 9000 101 --name openclaw-101
+          qm set 101 --ciuser root --cipassword '你的密码'
+          qm set 101 --ipconfig0 ip=dhcp
+          qm start 101
+          \`\`\`
+
+          ## 进入系统后
+
+          \`\`\`bash
+          cat /root/openclaw-info.txt
+          openclaw-set-api
+          systemctl status openclaw --no-pager -l
+          \`\`\`
+
+          EOF
+
+          echo "" >> release-notes.md
+          echo "## 构建信息" >> release-notes.md
+          echo '```text' >> release-notes.md
+          cat dist/build-info.txt >> release-notes.md
+          echo '```' >> release-notes.md
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.vars.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease || false }}
+        run: |
+          set -Eeuo pipefail
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release edit "$TAG_NAME" \
+              --title "OpenClaw KVM Cloud Image $TAG_NAME" \
+              --notes-file release-notes.md
+          else
+            if [[ "$PRERELEASE" == "true" ]]; then
+              gh release create "$TAG_NAME" \
+                --title "OpenClaw KVM Cloud Image $TAG_NAME" \
+                --notes-file release-notes.md \
+                --prerelease
+            else
+              gh release create "$TAG_NAME" \
+                --title "OpenClaw KVM Cloud Image $TAG_NAME" \
+                --notes-file release-notes.md
+            fi
+          fi
+
+          gh release upload "$TAG_NAME" \
+            dist/*.qcow2.xz \
+            dist/*.sha256 \
+            dist/*.list \
+            dist/build-info.txt \
+            --clobber
+
