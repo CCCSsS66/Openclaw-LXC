@@ -1,0 +1,31 @@
+name: Build Hermes Agent Root LXC
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/main2.yml"
+      - ".github/workflows/build-hermes-lxc.yml"
+      - "scripts/build-hermes-lxc.sh"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Hermes LXC and publish Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x scripts/build-hermes-lxc.sh
+          bash scripts/build-hermes-lxc.sh
