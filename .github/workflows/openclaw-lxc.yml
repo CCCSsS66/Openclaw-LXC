@@ -1,0 +1,1132 @@
+name: Build OpenClaw LXC
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，auto 为自动生成"
+        required: true
+        default: "auto"
+      openclaw_version:
+        description: "OpenClaw 版本，例如 latest"
+        required: true
+        default: "latest"
+      run_as_root:
+        description: "是否 root 运行 OpenClaw"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      gateway_port:
+        description: "OpenClaw Gateway 端口"
+        required: true
+        default: "18789"
+      gateway_bind:
+        description: "Gateway 绑定模式，不是网卡名"
+        required: true
+        default: "lan"
+        type: choice
+        options:
+          - "lan"
+          - "loopback"
+          - "auto"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    env:
+      INPUT_VERSION: ${{ inputs.version }}
+      INPUT_OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
+      INPUT_RUN_AS_ROOT: ${{ inputs.run_as_root }}
+      INPUT_GATEWAY_PORT: ${{ inputs.gateway_port }}
+      INPUT_GATEWAY_BIND: ${{ inputs.gateway_bind }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            debootstrap \
+            ca-certificates \
+            curl \
+            gnupg \
+            xz-utils \
+            gzip \
+            tar \
+            jq \
+            file \
+            openssl \
+            coreutils \
+            util-linux \
+            gh
+
+          gh --version
+
+      - name: Build and publish OpenClaw LXC template
+        shell: bash
+        run: |
+          cat > build-openclaw-lxc.sh <<'BUILD_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          export DEBIAN_FRONTEND=noninteractive
+
+          VERSION="${INPUT_VERSION:-auto}"
+          OPENCLAW_VERSION="${INPUT_OPENCLAW_VERSION:-latest}"
+          RUN_AS_ROOT="${INPUT_RUN_AS_ROOT:-true}"
+          GATEWAY_PORT="${INPUT_GATEWAY_PORT:-18789}"
+          GATEWAY_BIND="${INPUT_GATEWAY_BIND:-lan}"
+
+          if [ "$VERSION" = "auto" ]; then
+            VERSION="$(date -u +'%Y.%m.%d-%H%M')"
+          fi
+
+          IMAGE_PREFIX="openclaw-lxc-debian12"
+          IMAGE_NAME="${IMAGE_PREFIX}-${VERSION}.tar.gz"
+
+          if [ "$RUN_AS_ROOT" = "true" ]; then
+            RUN_USER="root"
+          else
+            RUN_USER="openclaw"
+          fi
+
+          WORK_DIR="$PWD/work"
+          ROOTFS="$WORK_DIR/rootfs"
+          DIST_DIR="$PWD/dist"
+
+          mkdir -p "$WORK_DIR" "$DIST_DIR"
+
+          cleanup_mounts() {
+            set +e
+            sudo umount -lf "$ROOTFS/dev/pts" 2>/dev/null || true
+            sudo umount -lf "$ROOTFS/dev" 2>/dev/null || true
+            sudo umount -lf "$ROOTFS/proc" 2>/dev/null || true
+            sudo umount -lf "$ROOTFS/sys" 2>/dev/null || true
+          }
+
+          trap cleanup_mounts EXIT
+
+          echo "=================================================="
+          echo "[1/8] 创建 Debian 12 rootfs"
+          echo "=================================================="
+
+          sudo debootstrap \
+            --arch=amd64 \
+            --variant=minbase \
+            bookworm \
+            "$ROOTFS" \
+            http://deb.debian.org/debian
+
+          echo "=================================================="
+          echo "[2/8] 挂载 chroot 环境"
+          echo "=================================================="
+
+          sudo mount -t proc proc "$ROOTFS/proc"
+          sudo mount --rbind /sys "$ROOTFS/sys"
+          sudo mount --make-rslave "$ROOTFS/sys"
+          sudo mount --rbind /dev "$ROOTFS/dev"
+          sudo mount --make-rslave "$ROOTFS/dev"
+          sudo mount --rbind /dev/pts "$ROOTFS/dev/pts"
+          sudo cp /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
+
+          echo "Openclaw" | sudo tee "$ROOTFS/etc/hostname" >/dev/null
+
+          echo "=================================================="
+          echo "[3/8] 写入容器内部安装脚本"
+          echo "=================================================="
+
+          sudo tee "$ROOTFS/tmp/install-inside.sh" >/dev/null <<'INSIDE_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          export DEBIAN_FRONTEND=noninteractive
+
+          OPENCLAW_VERSION="${OPENCLAW_VERSION:-latest}"
+          RUN_AS_ROOT="${RUN_AS_ROOT:-true}"
+          GATEWAY_PORT="${GATEWAY_PORT:-18789}"
+          GATEWAY_BIND="${GATEWAY_BIND:-lan}"
+
+          NET_IFACE="eth0"
+
+          if [ "$RUN_AS_ROOT" = "true" ]; then
+            OPENCLAW_USER="root"
+            OPENCLAW_GROUP="root"
+            OPENCLAW_HOME="/root"
+          else
+            OPENCLAW_USER="openclaw"
+            OPENCLAW_GROUP="openclaw"
+            OPENCLAW_HOME="/home/openclaw"
+          fi
+
+          cat >/etc/apt/sources.list <<'APT_SOURCES'
+          deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
+          deb http://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
+          deb http://security.debian.org/debian-security bookworm-security main contrib non-free non-free-firmware
+          APT_SOURCES
+
+          apt-get update
+
+          apt-get install -y --no-install-recommends \
+            systemd \
+            systemd-sysv \
+            dbus \
+            openssh-server \
+            ifupdown \
+            iproute2 \
+            iputils-ping \
+            net-tools \
+            procps \
+            ca-certificates \
+            curl \
+            wget \
+            gnupg \
+            sudo \
+            jq \
+            openssl \
+            coreutils \
+            bash-completion \
+            vim-tiny \
+            nano \
+            less \
+            locales \
+            git \
+            build-essential \
+            python3 \
+            make \
+            g++
+
+          apt-get purge -y isc-dhcp-client isc-dhcp-common dhcpcd5 2>/dev/null || true
+          apt-get autoremove -y || true
+
+          sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen || true
+          sed -i 's/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen || true
+          locale-gen || true
+
+          cat >/etc/default/locale <<'LOCALE_CONF'
+          LANG=en_US.UTF-8
+          LC_ALL=en_US.UTF-8
+          LOCALE_CONF
+
+          echo "=================================================="
+          echo "配置网络：不 DHCP，只接受 PVE 面板静态 IPv4"
+          echo "=================================================="
+
+          cat >/etc/network/interfaces <<'NET_CONF'
+          auto lo
+          iface lo inet loopback
+
+          source /etc/network/interfaces.d/*
+          NET_CONF
+
+          mkdir -p /etc/network/interfaces.d
+
+          cat >/etc/network/interfaces.d/00-openclaw-note <<'NET_NOTE'
+          # OpenClaw LXC network note:
+          # Do not enable DHCP here.
+          # Configure static IPv4 from Proxmox VE panel.
+          #
+          # PVE panel:
+          #   IPv4: Static
+          #   IPv4/CIDR: your static IPv4
+          #   Gateway: your IPv4 gateway
+          #   IPv6: Manual / Disabled
+          #
+          # PVE CLI example:
+          #   --net0 name=eth0,bridge=vmbr0,ip=192.168.1.50/24,gw=192.168.1.1,ip6=manual
+          NET_NOTE
+
+          systemctl unmask networking.service 2>/dev/null || true
+          systemctl enable networking.service 2>/dev/null || true
+
+          echo "=================================================="
+          echo "容器内禁用 IPv6"
+          echo "=================================================="
+
+          cat >/etc/sysctl.d/99-openclaw-disable-ipv6.conf <<'IPV6_SYSCTL'
+          net.ipv6.conf.all.disable_ipv6 = 1
+          net.ipv6.conf.default.disable_ipv6 = 1
+          net.ipv6.conf.lo.disable_ipv6 = 1
+          net.ipv6.conf.eth0.disable_ipv6 = 1
+          net.ipv6.conf.all.accept_ra = 0
+          net.ipv6.conf.default.accept_ra = 0
+          net.ipv6.conf.eth0.accept_ra = 0
+          net.ipv6.conf.all.autoconf = 0
+          net.ipv6.conf.default.autoconf = 0
+          net.ipv6.conf.eth0.autoconf = 0
+          IPV6_SYSCTL
+
+          cat >/etc/systemd/system/openclaw-disable-ipv6.service <<'IPV6_SERVICE'
+          [Unit]
+          Description=Disable IPv6 inside OpenClaw LXC
+          DefaultDependencies=no
+          After=local-fs.target
+          Before=network-pre.target network.target networking.service openclaw-net-up.service openclaw-gateway.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/sh -c 'sysctl -w net.ipv6.conf.all.disable_ipv6=1 || true; sysctl -w net.ipv6.conf.default.disable_ipv6=1 || true; sysctl -w net.ipv6.conf.lo.disable_ipv6=1 || true; sysctl -w net.ipv6.conf.eth0.disable_ipv6=1 || true; sysctl -w net.ipv6.conf.all.accept_ra=0 || true; sysctl -w net.ipv6.conf.default.accept_ra=0 || true; sysctl -w net.ipv6.conf.eth0.accept_ra=0 || true; sysctl -w net.ipv6.conf.all.autoconf=0 || true; sysctl -w net.ipv6.conf.default.autoconf=0 || true; sysctl -w net.ipv6.conf.eth0.autoconf=0 || true; ip -6 addr flush dev eth0 2>/dev/null || true'
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          IPV6_SERVICE
+
+          systemctl enable openclaw-disable-ipv6.service
+
+          cat >/etc/systemd/system/openclaw-net-up.service <<'NET_UP_SERVICE'
+          [Unit]
+          Description=Bring up LXC eth0 without DHCP
+          DefaultDependencies=no
+          After=local-fs.target openclaw-disable-ipv6.service
+          Before=network-pre.target network.target networking.service network-online.target ssh.service openclaw-firstboot.service openclaw-gateway.service
+          Wants=openclaw-disable-ipv6.service network.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/bin/sh -c 'ip link set lo up 2>/dev/null || true; ip link set eth0 up 2>/dev/null || true; ifup -a 2>/dev/null || true; ip -6 addr flush dev eth0 2>/dev/null || true'
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          NET_UP_SERVICE
+
+          systemctl enable openclaw-net-up.service
+
+          echo "=================================================="
+          echo "配置 SSH 密码登录"
+          echo "=================================================="
+
+          mkdir -p /var/run/sshd
+          mkdir -p /etc/ssh/sshd_config.d
+
+          cat >/etc/ssh/sshd_config.d/99-openclaw-lxc.conf <<'SSH_CONF'
+          PasswordAuthentication yes
+          PermitRootLogin yes
+          KbdInteractiveAuthentication yes
+          UsePAM yes
+          SSH_CONF
+
+          sed -ri 's/^#?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sed -ri 's/^#?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+          sed -ri 's/^#?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config || true
+          sed -ri 's/^#?UsePAM .*/UsePAM yes/' /etc/ssh/sshd_config || true
+
+          cat >/etc/systemd/system/regenerate-ssh-host-keys.service <<'SSH_KEY_SERVICE'
+          [Unit]
+          Description=Regenerate SSH host keys on first boot
+          ConditionPathExistsGlob=!/etc/ssh/ssh_host_*_key
+          Before=ssh.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/ssh-keygen -A
+
+          [Install]
+          WantedBy=multi-user.target
+          SSH_KEY_SERVICE
+
+          systemctl enable regenerate-ssh-host-keys.service
+          systemctl enable ssh.service || systemctl enable ssh || true
+
+          echo "=================================================="
+          echo "安装 Node.js 24"
+          echo "=================================================="
+
+          curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+          apt-get install -y nodejs
+
+          node --version
+          npm --version
+
+          npm config set fund false
+          npm config set audit false
+          npm config set update-notifier false
+
+          echo "=================================================="
+          echo "安装 OpenClaw"
+          echo "=================================================="
+
+          npm install -g "openclaw@${OPENCLAW_VERSION}"
+
+          command -v openclaw
+          openclaw --version || true
+
+          echo "=================================================="
+          echo "安装完成后切换中国 apt / npm 源"
+          echo "=================================================="
+
+          cat >/etc/apt/sources.list <<'CHINA_APT_SOURCES'
+          deb https://mirrors.tuna.tsinghua.edu.cn/debian bookworm main contrib non-free non-free-firmware
+          deb https://mirrors.tuna.tsinghua.edu.cn/debian bookworm-updates main contrib non-free non-free-firmware
+          deb https://mirrors.tuna.tsinghua.edu.cn/debian-security bookworm-security main contrib non-free non-free-firmware
+          CHINA_APT_SOURCES
+
+          rm -f /etc/apt/sources.list.d/nodesource*.list 2>/dev/null || true
+          rm -f /etc/apt/sources.list.d/*node*.list 2>/dev/null || true
+
+          apt-get update || {
+            echo "清华源失败，切换中科大源"
+            cat >/etc/apt/sources.list <<'USTC_APT_SOURCES'
+          deb https://mirrors.ustc.edu.cn/debian bookworm main contrib non-free non-free-firmware
+          deb https://mirrors.ustc.edu.cn/debian bookworm-updates main contrib non-free non-free-firmware
+          deb https://mirrors.ustc.edu.cn/debian-security bookworm-security main contrib non-free non-free-firmware
+          USTC_APT_SOURCES
+            apt-get update || true
+          }
+
+          npm config set registry https://registry.npmmirror.com
+          npm config set fund false
+          npm config set audit false
+          npm config set update-notifier false
+
+          if [ "$RUN_AS_ROOT" != "true" ]; then
+            id openclaw >/dev/null 2>&1 || useradd -m -s /bin/bash openclaw
+            usermod -aG sudo openclaw || true
+          fi
+
+          mkdir -p "$OPENCLAW_HOME/.openclaw/workspace"
+          mkdir -p "$OPENCLAW_HOME/.openclaw/agents/main/sessions"
+          mkdir -p "$OPENCLAW_HOME/.openclaw/agents/main/agent"
+
+          chown -R "$OPENCLAW_USER:$OPENCLAW_GROUP" "$OPENCLAW_HOME/.openclaw" || true
+
+          cat >/etc/openclaw-lxc.env <<ENV_CONF
+          OPENCLAW_LXC=1
+          OPENCLAW_USER=$OPENCLAW_USER
+          OPENCLAW_GROUP=$OPENCLAW_GROUP
+          OPENCLAW_HOME=$OPENCLAW_HOME
+          OPENCLAW_NET_IFACE=$NET_IFACE
+          OPENCLAW_GATEWAY_PORT=$GATEWAY_PORT
+          OPENCLAW_GATEWAY_BIND=$GATEWAY_BIND
+          OPENCLAW_HIDE_BANNER=1
+          ENV_CONF
+
+          chmod 644 /etc/openclaw-lxc.env
+
+          echo "=================================================="
+          echo "写入 OpenClaw 保底配置脚本：不覆盖模型配置"
+          echo "=================================================="
+
+          cat >/usr/local/sbin/openclaw-ensure-config <<'ENSURE_CONF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          [ -f /etc/openclaw-lxc.env ] && . /etc/openclaw-lxc.env
+
+          OPENCLAW_USER="${OPENCLAW_USER:-root}"
+          OPENCLAW_GROUP="${OPENCLAW_GROUP:-root}"
+          OPENCLAW_HOME="${OPENCLAW_HOME:-/root}"
+          OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
+          OPENCLAW_GATEWAY_BIND="${OPENCLAW_GATEWAY_BIND:-lan}"
+
+          ENV_FILE="$OPENCLAW_HOME/.openclaw/.env"
+          CONFIG_FILE="$OPENCLAW_HOME/.openclaw/openclaw.json"
+
+          mkdir -p "$OPENCLAW_HOME/.openclaw/workspace"
+          mkdir -p "$OPENCLAW_HOME/.openclaw/agents/main/sessions"
+          mkdir -p "$OPENCLAW_HOME/.openclaw/agents/main/agent"
+
+          if [ ! -s "$ENV_FILE" ]; then
+            TOKEN="$(openssl rand -hex 32)"
+            PASSWORD="$(openssl rand -base64 36 | tr -d '/+=' | head -c 28)"
+
+            cat >"$ENV_FILE" <<TOKEN_ENV
+          OPENCLAW_GATEWAY_TOKEN=$TOKEN
+          OPENCLAW_GATEWAY_PASSWORD=$PASSWORD
+          OPENCLAW_GATEWAY_PORT=$OPENCLAW_GATEWAY_PORT
+          OPENCLAW_GATEWAY_BIND=$OPENCLAW_GATEWAY_BIND
+          TOKEN_ENV
+          fi
+
+          if [ ! -s "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+            echo '{}' >"$CONFIG_FILE"
+          fi
+
+          TMP_FILE="$(mktemp)"
+
+          jq \
+            --arg bind "$OPENCLAW_GATEWAY_BIND" \
+            --arg tokenRef '${OPENCLAW_GATEWAY_TOKEN}' \
+            --argjson port "$OPENCLAW_GATEWAY_PORT" \
+            '
+            .gateway = (.gateway // {}) |
+            .gateway.mode = "local" |
+            .gateway.port = $port |
+            .gateway.bind = $bind |
+            .gateway.auth = (.gateway.auth // {}) |
+            .gateway.auth.mode = "token" |
+            .gateway.auth.token = $tokenRef |
+            .gateway.auth.rateLimit = (.gateway.auth.rateLimit // {}) |
+            .gateway.auth.rateLimit.maxAttempts = 20 |
+            .gateway.auth.rateLimit.windowMs = 60000 |
+            .gateway.auth.rateLimit.lockoutMs = 300000 |
+            .gateway.auth.rateLimit.exemptLoopback = true |
+            .gateway.controlUi = (.gateway.controlUi // {}) |
+            .gateway.controlUi.enabled = true |
+            .gateway.controlUi.allowInsecureAuth = true |
+            .gateway.controlUi.dangerouslyDisableDeviceAuth = true |
+            .gateway.reload = (.gateway.reload // {}) |
+            .gateway.reload.mode = "hybrid" |
+            .agents = (.agents // {}) |
+            .agents.defaults = (.agents.defaults // {}) |
+            .agents.defaults.workspace = (.agents.defaults.workspace // "~/.openclaw/workspace") |
+            .cli = (.cli // {}) |
+            .cli.banner = (.cli.banner // {}) |
+            .cli.banner.taglineMode = "off"
+            ' "$CONFIG_FILE" >"$TMP_FILE"
+
+          mv "$TMP_FILE" "$CONFIG_FILE"
+
+          chown -R "$OPENCLAW_USER:$OPENCLAW_GROUP" "$OPENCLAW_HOME/.openclaw" 2>/dev/null || true
+          chmod 700 "$OPENCLAW_HOME/.openclaw" || true
+          chmod 600 "$ENV_FILE" "$CONFIG_FILE" || true
+          ENSURE_CONF
+
+          chmod +x /usr/local/sbin/openclaw-ensure-config
+
+          echo "=================================================="
+          echo "写入 API 配置脚本：只填地址、模型、Key、是否思考"
+          echo "=================================================="
+
+          cat >/usr/local/bin/openclaw-api-setup <<'API_SETUP'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          [ -f /etc/openclaw-lxc.env ] && . /etc/openclaw-lxc.env
+
+          OPENCLAW_USER="${OPENCLAW_USER:-root}"
+          OPENCLAW_GROUP="${OPENCLAW_GROUP:-root}"
+          OPENCLAW_HOME="${OPENCLAW_HOME:-/root}"
+
+          CONFIG_FILE="$OPENCLAW_HOME/.openclaw/openclaw.json"
+          ENV_FILE="$OPENCLAW_HOME/.openclaw/.env"
+
+          echo "============================================================"
+          echo "OpenClaw API 配置"
+          echo "============================================================"
+          echo "只需要填写 4 项："
+          echo "  1. API 地址"
+          echo "  2. 模型名称"
+          echo "  3. API Key"
+          echo "  4. 是否支持思考 / reasoning"
+          echo
+          echo "API 地址可以填："
+          echo "  https://api.deepseek.com"
+          echo "  https://api.deepseek.com/v1"
+          echo "  https://api.deepseek.com/v1/chat/completions"
+          echo
+          echo "脚本会自动补全 /v1/chat/completions。"
+          echo "============================================================"
+          echo
+
+          read -r -p "API 地址: " API_INPUT
+          read -r -p "模型名称: " MODEL_ID
+          read -r -s -p "API Key: " API_KEY
+          echo
+          read -r -p "是否支持思考 / reasoning？y/N: " REASONING_INPUT
+
+          API_INPUT="$(echo "$API_INPUT" | xargs)"
+          MODEL_ID="$(echo "$MODEL_ID" | xargs)"
+          API_KEY="$(echo "$API_KEY" | xargs)"
+          API_INPUT="${API_INPUT%/}"
+          REASONING_INPUT="${REASONING_INPUT:-N}"
+
+          case "$REASONING_INPUT" in
+            y|Y|yes|YES|Yes|true|TRUE|1)
+              MODEL_REASONING="true"
+              ;;
+            *)
+              MODEL_REASONING="false"
+              ;;
+          esac
+
+          if [ -z "$API_INPUT" ] || [ -z "$MODEL_ID" ] || [ -z "$API_KEY" ]; then
+            echo "错误：API 地址、模型名称、API Key 不能为空。"
+            exit 1
+          fi
+
+          case "$API_INPUT" in
+            http://*|https://*)
+              ;;
+            *)
+              echo "错误：API 地址必须以 http:// 或 https:// 开头。"
+              echo "正确示例：https://api.deepseek.com"
+              exit 1
+              ;;
+          esac
+
+          case "$API_INPUT" in
+            */v1/chat/completions)
+              CHAT_COMPLETIONS_URL="$API_INPUT"
+              BASE_URL="${API_INPUT%/chat/completions}"
+              ;;
+            */chat/completions)
+              RAW_BASE="${API_INPUT%/chat/completions}"
+              if echo "$RAW_BASE" | grep -q '/v1$'; then
+                BASE_URL="$RAW_BASE"
+              else
+                BASE_URL="$RAW_BASE/v1"
+              fi
+              CHAT_COMPLETIONS_URL="$BASE_URL/chat/completions"
+              ;;
+            */v1)
+              BASE_URL="$API_INPUT"
+              CHAT_COMPLETIONS_URL="$BASE_URL/chat/completions"
+              ;;
+            *)
+              BASE_URL="$API_INPUT/v1"
+              CHAT_COMPLETIONS_URL="$BASE_URL/chat/completions"
+              ;;
+          esac
+
+          /usr/local/sbin/openclaw-ensure-config
+
+          if [ ! -s "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+            echo '{}' >"$CONFIG_FILE"
+          fi
+
+          TMP_ENV="$(mktemp)"
+          grep -v '^OPENCLAW_PROVIDER_API_KEY=' "$ENV_FILE" 2>/dev/null >"$TMP_ENV" || true
+          printf 'OPENCLAW_PROVIDER_API_KEY=%s\n' "$API_KEY" >>"$TMP_ENV"
+          mv "$TMP_ENV" "$ENV_FILE"
+
+          PRIMARY_MODEL="custom/$MODEL_ID"
+          TMP_FILE="$(mktemp)"
+
+          jq \
+            --arg baseUrl "$BASE_URL" \
+            --arg modelId "$MODEL_ID" \
+            --arg primaryModel "$PRIMARY_MODEL" \
+            --argjson reasoning "$MODEL_REASONING" \
+            '
+            .models = (.models // {}) |
+            .models.mode = "merge" |
+            .models.providers = (.models.providers // {}) |
+            .models.providers.custom = {
+              baseUrl: $baseUrl,
+              apiKey: "${OPENCLAW_PROVIDER_API_KEY}",
+              auth: "api-key",
+              api: "openai-completions",
+              models: [
+                {
+                  id: $modelId,
+                  name: $modelId,
+                  input: ["text"],
+                  reasoning: $reasoning
+                }
+              ]
+            } |
+            .agents = (.agents // {}) |
+            .agents.defaults = (.agents.defaults // {}) |
+            .agents.defaults.model = {
+              primary: $primaryModel,
+              fallbacks: []
+            }
+            ' "$CONFIG_FILE" >"$TMP_FILE"
+
+          mv "$TMP_FILE" "$CONFIG_FILE"
+
+          chown -R "$OPENCLAW_USER:$OPENCLAW_GROUP" "$OPENCLAW_HOME/.openclaw" 2>/dev/null || true
+          chmod 700 "$OPENCLAW_HOME/.openclaw" || true
+          chmod 600 "$ENV_FILE" "$CONFIG_FILE" || true
+
+          echo
+          echo "============================================================"
+          echo "API 配置完成"
+          echo "============================================================"
+          echo "你填写的 API 地址:"
+          echo "  $API_INPUT"
+          echo
+          echo "自动生成 Chat Completions 地址:"
+          echo "  $CHAT_COMPLETIONS_URL"
+          echo
+          echo "写入 OpenClaw 的 Base URL:"
+          echo "  $BASE_URL"
+          echo
+          echo "默认模型:"
+          echo "  $PRIMARY_MODEL"
+          echo
+          echo "是否支持思考:"
+          echo "  $MODEL_REASONING"
+          echo
+          echo "配置文件:"
+          echo "  $CONFIG_FILE"
+          echo "============================================================"
+
+          echo
+          echo "重启 OpenClaw Gateway..."
+          systemctl restart openclaw-gateway || true
+          sleep 3
+
+          /usr/local/sbin/openclaw-refresh-info || true
+
+          echo
+          echo "当前配置关键内容:"
+          jq '.models, .agents.defaults.model' "$CONFIG_FILE" || true
+
+          echo
+          echo "测试 API 连通性："
+          TEST_BODY="$(jq -nc --arg model "$MODEL_ID" '{model:$model,messages:[{role:"user",content:"ping"}],max_tokens:8,stream:false}')"
+
+          HTTP_CODE="$(
+            curl -sS \
+              --connect-timeout 10 \
+              --max-time 30 \
+              -o /tmp/openclaw-api-test-response.json \
+              -w '%{http_code}' \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "$TEST_BODY" \
+              "$CHAT_COMPLETIONS_URL" || true
+          )"
+
+          echo "HTTP 状态码: ${HTTP_CODE:-无}"
+          if [ -s /tmp/openclaw-api-test-response.json ]; then
+            cat /tmp/openclaw-api-test-response.json
+            echo
+          fi
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "API 测试成功。"
+          else
+            echo "API 测试没有返回 200。配置已经写入，请检查 Key、模型名、额度或接口兼容性。"
+          fi
+          API_SETUP
+
+          chmod +x /usr/local/bin/openclaw-api-setup
+
+          echo "=================================================="
+          echo "写入信息刷新脚本：只显示 IPv4"
+          echo "=================================================="
+
+          cat >/usr/local/sbin/openclaw-refresh-info <<'REFRESH_INFO'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          [ -f /etc/openclaw-lxc.env ] && . /etc/openclaw-lxc.env
+
+          OPENCLAW_USER="${OPENCLAW_USER:-root}"
+          OPENCLAW_HOME="${OPENCLAW_HOME:-/root}"
+          OPENCLAW_NET_IFACE="${OPENCLAW_NET_IFACE:-eth0}"
+          OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
+          OPENCLAW_GATEWAY_BIND="${OPENCLAW_GATEWAY_BIND:-lan}"
+
+          ENV_FILE="$OPENCLAW_HOME/.openclaw/.env"
+          INFO_FILE="/root/openclaw-info.txt"
+
+          sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+          sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+          sysctl -w net.ipv6.conf.eth0.disable_ipv6=1 >/dev/null 2>&1 || true
+          ip -6 addr flush dev "$OPENCLAW_NET_IFACE" 2>/dev/null || true
+
+          ip link set lo up 2>/dev/null || true
+          ip link set "$OPENCLAW_NET_IFACE" up 2>/dev/null || true
+
+          if command -v ifup >/dev/null 2>&1; then
+            ifup -a 2>/dev/null || true
+          fi
+
+          /usr/local/sbin/openclaw-ensure-config || true
+
+          TOKEN=""
+          PASSWORD=""
+
+          if [ -s "$ENV_FILE" ]; then
+            TOKEN="$(grep '^OPENCLAW_GATEWAY_TOKEN=' "$ENV_FILE" | cut -d= -f2- || true)"
+            PASSWORD="$(grep '^OPENCLAW_GATEWAY_PASSWORD=' "$ENV_FILE" | cut -d= -f2- || true)"
+          fi
+
+          IPV4_LIST="$(ip -o -4 addr show dev "$OPENCLAW_NET_IFACE" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | paste -sd ' ' - || true)"
+
+          FIRST_IPV4="$(echo "$IPV4_LIST" | awk '{print $1}')"
+
+          if systemctl is-active openclaw-gateway >/dev/null 2>&1; then
+            GATEWAY_STATUS="running"
+          else
+            GATEWAY_STATUS="not-running"
+          fi
+
+          {
+            echo "============================================================"
+            echo "OpenClaw LXC Template"
+            echo "============================================================"
+            echo "OpenClaw 用户: $OPENCLAW_USER"
+            echo "LXC 网卡: $OPENCLAW_NET_IFACE"
+            echo "网络模式: PVE 静态 IPv4，不使用 DHCP"
+            echo "IPv6 状态: 容器内已禁用"
+            echo "Gateway 端口: $OPENCLAW_GATEWAY_PORT"
+            echo "Gateway 绑定: $OPENCLAW_GATEWAY_BIND"
+            echo "Gateway 状态: $GATEWAY_STATUS"
+            echo
+            echo "IPv4 地址: ${IPV4_LIST:-未检测到}"
+            echo
+            if [ -n "${FIRST_IPV4:-}" ]; then
+              echo "访问地址:"
+              echo "  http://$FIRST_IPV4:$OPENCLAW_GATEWAY_PORT"
+              echo "  ws://$FIRST_IPV4:$OPENCLAW_GATEWAY_PORT"
+            else
+              echo "访问地址:"
+              echo "  未检测到 IPv4。请到 PVE 管理面板给 net0 配置静态 IPv4。"
+            fi
+            echo
+            echo "Gateway Token:"
+            echo "  ${TOKEN:-未生成}"
+            echo
+            echo "Gateway Password:"
+            echo "  ${PASSWORD:-未生成}"
+            echo
+            echo "配置自定义 API:"
+            echo "  openclaw-api-setup"
+            echo
+            echo "网络说明:"
+            echo "  本模板不使用 DHCP。"
+            echo "  请在 PVE 管理面板配置静态 IPv4。"
+            echo "  IPv6 请在 PVE 面板设置为 Manual/禁用，容器内也会强制禁用。"
+            echo
+            echo "服务管理:"
+            echo "  systemctl status openclaw-gateway --no-pager"
+            echo "  systemctl restart openclaw-gateway"
+            echo "  journalctl -u openclaw-gateway -f"
+            echo "============================================================"
+          } >"$INFO_FILE"
+
+          chmod 600 "$INFO_FILE"
+          cp "$INFO_FILE" /etc/motd || true
+          REFRESH_INFO
+
+          chmod +x /usr/local/sbin/openclaw-refresh-info
+
+          echo "=================================================="
+          echo "写入登录提示"
+          echo "=================================================="
+
+          cat >/etc/profile.d/openclaw-info.sh <<'LOGIN_INFO'
+          #!/usr/bin/env bash
+
+          if [ "$(id -u)" = "0" ]; then
+            if [ -x /usr/local/sbin/openclaw-refresh-info ]; then
+              /usr/local/sbin/openclaw-refresh-info >/dev/null 2>&1 || true
+            fi
+
+            if [ -f /root/openclaw-info.txt ]; then
+              cat /root/openclaw-info.txt
+            fi
+
+            if [ ! -f /root/.openclaw/.openclaw-api-hint-shown ]; then
+              mkdir -p /root/.openclaw 2>/dev/null || true
+              touch /root/.openclaw/.openclaw-api-hint-shown 2>/dev/null || true
+              echo
+              echo "首次使用建议运行：openclaw-api-setup"
+              echo "API 地址可直接填：https://api.deepseek.com"
+              echo
+            fi
+          fi
+          LOGIN_INFO
+
+          chmod +x /etc/profile.d/openclaw-info.sh
+
+          echo "=================================================="
+          echo "写入 systemd 服务"
+          echo "=================================================="
+
+          cat >/etc/systemd/system/openclaw-firstboot.service <<'FIRSTBOOT_SERVICE'
+          [Unit]
+          Description=OpenClaw LXC first boot setup
+          After=openclaw-disable-ipv6.service openclaw-net-up.service networking.service network-online.target
+          Wants=openclaw-disable-ipv6.service openclaw-net-up.service networking.service network-online.target
+
+          [Service]
+          Type=oneshot
+          EnvironmentFile=-/etc/openclaw-lxc.env
+          ExecStart=/usr/local/sbin/openclaw-refresh-info
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          FIRSTBOOT_SERVICE
+
+          if [ "$OPENCLAW_USER" = "root" ]; then
+            SERVICE_USER_LINES=""
+          else
+            SERVICE_USER_LINES="User=$OPENCLAW_USER
+          Group=$OPENCLAW_GROUP"
+          fi
+
+          cat >/etc/systemd/system/openclaw-gateway.service <<GATEWAY_SERVICE
+          [Unit]
+          Description=OpenClaw Gateway
+          After=openclaw-disable-ipv6.service openclaw-net-up.service networking.service network-online.target openclaw-firstboot.service
+          Wants=openclaw-disable-ipv6.service openclaw-net-up.service networking.service network-online.target openclaw-firstboot.service
+
+          [Service]
+          Type=simple
+          $SERVICE_USER_LINES
+          WorkingDirectory=$OPENCLAW_HOME
+          EnvironmentFile=-/etc/openclaw-lxc.env
+          EnvironmentFile=-$OPENCLAW_HOME/.openclaw/.env
+          Environment=HOME=$OPENCLAW_HOME
+          Environment=OPENCLAW_HOME=$OPENCLAW_HOME
+          Environment=OPENCLAW_CONFIG_PATH=$OPENCLAW_HOME/.openclaw/openclaw.json
+          Environment=OPENCLAW_HIDE_BANNER=1
+          ExecStartPre=/usr/local/sbin/openclaw-ensure-config
+          ExecStart=/usr/bin/openclaw gateway
+          Restart=always
+          RestartSec=5
+          TimeoutStartSec=120
+          TimeoutStopSec=30
+          SuccessExitStatus=0 143
+          KillMode=control-group
+
+          [Install]
+          WantedBy=multi-user.target
+          GATEWAY_SERVICE
+
+          systemctl enable openclaw-firstboot.service
+          systemctl enable openclaw-gateway.service
+
+          echo "=================================================="
+          echo "写入 README"
+          echo "=================================================="
+
+          cat >/root/README-OPENCLAW-LXC.txt <<README_FILE
+          OpenClaw LXC Template
+
+          重点：
+          1. LXC 网卡名是 eth0。
+          2. lan 是 OpenClaw Gateway 绑定模式，不是网卡名。
+          3. 本模板不使用 DHCP。
+          4. 请在 PVE 管理面板配置静态 IPv4。
+          5. IPv6 已在容器内禁用，避免路由器 RA 下发 IPv6。
+          6. 已开启 SSH 密码登录和 root 登录。
+          7. 不内置 root 密码，请在 PVE 创建 CT 时设置。
+          8. 登录后运行 openclaw-api-setup 配置 API。
+          9. API 地址可以直接填：https://api.deepseek.com
+
+          PVE CLI 静态 IPv4 示例：
+            pct create 101 local:vztmpl/模板文件名.tar.gz \\
+              --hostname Openclaw \\
+              --ostype debian \\
+              --cores 2 \\
+              --memory 2048 \\
+              --rootfs local-lvm:8 \\
+              --net0 name=eth0,bridge=vmbr0,ip=192.168.1.50/24,gw=192.168.1.1,ip6=manual \\
+              --features nesting=1 \\
+              --unprivileged 0 \\
+              --password '你的root密码' \\
+              --start 1
+
+          常用命令：
+            ip a
+            openclaw-api-setup
+            systemctl status openclaw-gateway --no-pager
+            systemctl restart openclaw-gateway
+            journalctl -u openclaw-gateway -f
+          README_FILE
+
+          chmod 600 /root/README-OPENCLAW-LXC.txt
+
+          echo "=================================================="
+          echo "清理模板"
+          echo "=================================================="
+
+          rm -f /etc/machine-id
+          touch /etc/machine-id
+          rm -f /var/lib/dbus/machine-id || true
+          ln -sf /etc/machine-id /var/lib/dbus/machine-id || true
+
+          rm -f /etc/ssh/ssh_host_* || true
+
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+          rm -rf /tmp/*
+          rm -rf /var/tmp/*
+          rm -f /root/.bash_history || true
+
+          echo "OpenClaw LXC rootfs ready."
+          INSIDE_SCRIPT
+
+          sudo chmod +x "$ROOTFS/tmp/install-inside.sh"
+
+          echo "=================================================="
+          echo "[4/8] chroot 安装 OpenClaw"
+          echo "=================================================="
+
+          sudo env \
+            OPENCLAW_VERSION="$OPENCLAW_VERSION" \
+            RUN_AS_ROOT="$RUN_AS_ROOT" \
+            GATEWAY_PORT="$GATEWAY_PORT" \
+            GATEWAY_BIND="$GATEWAY_BIND" \
+            chroot "$ROOTFS" /bin/bash /tmp/install-inside.sh
+
+          echo "=================================================="
+          echo "[5/8] 卸载 chroot 挂载点"
+          echo "=================================================="
+
+          cleanup_mounts
+          trap - EXIT
+
+          echo "=================================================="
+          echo "[6/8] 自检"
+          echo "=================================================="
+
+          sudo test -x "$ROOTFS/usr/bin/openclaw"
+          sudo test -x "$ROOTFS/usr/local/bin/openclaw-api-setup"
+          sudo test -x "$ROOTFS/usr/local/sbin/openclaw-refresh-info"
+          sudo test -x "$ROOTFS/usr/local/sbin/openclaw-ensure-config"
+
+          sudo test -f "$ROOTFS/etc/network/interfaces"
+          sudo grep -q "source /etc/network/interfaces.d/*" "$ROOTFS/etc/network/interfaces"
+
+          if sudo grep -R "iface eth0 inet dhcp" "$ROOTFS/etc/network/interfaces" "$ROOTFS/etc/network/interfaces.d" >/dev/null 2>&1; then
+            echo "错误：网络配置里发现 DHCP"
+            exit 1
+          fi
+
+          if sudo chroot "$ROOTFS" sh -c 'command -v dhclient' >/dev/null 2>&1; then
+            echo "错误：dhclient 不应该存在"
+            exit 1
+          fi
+
+          sudo test -f "$ROOTFS/etc/sysctl.d/99-openclaw-disable-ipv6.conf"
+          sudo grep -q "net.ipv6.conf.all.disable_ipv6 = 1" "$ROOTFS/etc/sysctl.d/99-openclaw-disable-ipv6.conf"
+
+          sudo test -f "$ROOTFS/etc/systemd/system/openclaw-disable-ipv6.service"
+          sudo test -f "$ROOTFS/etc/systemd/system/openclaw-net-up.service"
+          sudo test -f "$ROOTFS/etc/systemd/system/openclaw-firstboot.service"
+          sudo test -f "$ROOTFS/etc/systemd/system/openclaw-gateway.service"
+
+          sudo grep -q "PasswordAuthentication yes" "$ROOTFS/etc/ssh/sshd_config.d/99-openclaw-lxc.conf"
+          sudo grep -q "PermitRootLogin yes" "$ROOTFS/etc/ssh/sshd_config.d/99-openclaw-lxc.conf"
+
+          sudo grep -q "mirrors.tuna.tsinghua.edu.cn" "$ROOTFS/etc/apt/sources.list" || sudo grep -q "mirrors.ustc.edu.cn" "$ROOTFS/etc/apt/sources.list"
+          sudo chroot "$ROOTFS" npm config get registry | grep -q "registry.npmmirror.com"
+
+          echo "=================================================="
+          echo "[7/8] 打包 LXC tar.gz"
+          echo "=================================================="
+
+          sudo tar \
+            --numeric-owner \
+            --xattrs \
+            --acls \
+            -czpf "$DIST_DIR/$IMAGE_NAME" \
+            -C "$ROOTFS" .
+
+          cd "$DIST_DIR"
+          sha256sum "$IMAGE_NAME" > "$IMAGE_NAME.sha256"
+
+          cat > RELEASE.md <<RELEASE_NOTES
+          # OpenClaw LXC Template $VERSION
+
+          ## 文件
+
+          - $IMAGE_NAME
+          - $IMAGE_NAME.sha256
+
+          ## 特性
+
+          - Debian 12 LXC
+          - 安装 OpenClaw
+          - Node.js 24
+          - SSH 密码登录开启
+          - root SSH 登录开启
+          - 登录自动显示 IPv4 访问地址
+          - 安装完成后 apt 源切换为中国镜像
+          - npm 源切换为 npmmirror
+          - API 配置只填：API 地址、模型名称、API Key、是否支持思考
+          - API 地址可填域名，例如 https://api.deepseek.com
+          - 自动补全为 /v1/chat/completions
+          - Gateway 端口：$GATEWAY_PORT
+          - Gateway 绑定：$GATEWAY_BIND
+          - OpenClaw 运行用户：$RUN_USER
+
+          ## PVE 管理面板配置
+
+          创建 CT 时，请在 PVE 面板里设置：
+
+          - IPv4：Static
+          - IPv4/CIDR：你的静态 IPv4，例如 192.168.1.50/24
+          - Gateway：你的 IPv4 网关，例如 192.168.1.1
+          - IPv6：Manual / Disabled
+
+
+          ## 首次登录
+
+          \`\`\`bash
+          openclaw-api-setup
+          \`\`\`
+
+          API 地址可以直接填：
+
+          \`\`\`text
+          https://api.deepseek.com
+          \`\`\`
+
+          脚本会自动变成：
+
+          \`\`\`text
+          https://api.deepseek.com/v1/chat/completions
+          \`\`\`
+
+          查看服务：
+
+          \`\`\`bash
+          systemctl status openclaw-gateway --no-pager
+          journalctl -u openclaw-gateway -f
+          \`\`\`
+          RELEASE_NOTES
+
+          ls -lh "$IMAGE_NAME" "$IMAGE_NAME.sha256" RELEASE.md
+
+          echo "=================================================="
+          echo "[8/8] 发布 GitHub Release"
+          echo "=================================================="
+
+          TAG="openclaw-lxc-${VERSION}"
+          TITLE="OpenClaw LXC ${VERSION}"
+
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Tag: $TAG"
+          echo "Image: $IMAGE_NAME"
+
+          gh auth status --hostname github.com || true
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release 已存在，覆盖上传文件"
+            gh release upload "$TAG" \
+              "$IMAGE_NAME" \
+              "$IMAGE_NAME.sha256" \
+              RELEASE.md \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            echo "创建 Release 并上传文件"
+            gh release create "$TAG" \
+              "$IMAGE_NAME" \
+              "$IMAGE_NAME.sha256" \
+              RELEASE.md \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes-file RELEASE.md
+          fi
+
+          echo "=================================================="
+          echo "Release 上传完成"
+          echo "=================================================="
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY"
+
+          BUILD_SCRIPT
+
+          chmod +x build-openclaw-lxc.sh
+          ./build-openclaw-lxc.sh
