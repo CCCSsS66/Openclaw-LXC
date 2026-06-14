@@ -583,17 +583,6 @@ jobs:
             .cli.banner = (.cli.banner // {}) |
             .cli.banner.taglineMode = "off" |
 
-            # ============================================================
-            # 危险模式：
-            # 1. profile 使用 full
-            # 2. 删除 allow 白名单
-            # 3. 删除 deny 黑名单
-            # 4. openclaw-gateway.service 以 root 运行
-            #
-            # 效果：
-            # OpenClaw 如果模型和 OpenClaw 本身支持 shell/system/filesystem 工具，
-            # 将不再被 allow/deny 限制。
-            # ============================================================
             .tools = (.tools // {}) |
             .tools.profile = "full" |
             del(.tools.allow) |
@@ -975,11 +964,6 @@ jobs:
             echo
             echo "Gateway Token:"
             echo "  ${TOKEN:-未生成}"
-            echo
-            echo "权限模式:"
-            echo "  危险模式：OpenClaw Gateway 以 root 运行，tools.profile=full。"
-            echo "  已删除 tools.allow / tools.deny 限制。"
-            echo "  如果模型支持工具调用，它可以执行 shell / system / filesystem 等高危操作。"
             echo
             echo "第一次使用:"
             echo "  1. 运行 openclaw-api-setup"
