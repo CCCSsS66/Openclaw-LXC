@@ -1,4 +1,4 @@
-name: Build OpenClaw LXC 2
+name: Build OpenClaw LXC Ubuntu
 
 on:
   workflow_dispatch:
@@ -498,6 +498,7 @@ jobs:
 
           cat >/etc/openclaw-lxc.env <<ENV_CONF
           OPENCLAW_LXC=1
+          OPENCLAW_DANGEROUS_FULL_TOOLS=1
           OPENCLAW_USER=$OPENCLAW_USER
           OPENCLAW_GROUP=$OPENCLAW_GROUP
           OPENCLAW_HOME=$OPENCLAW_HOME
@@ -510,7 +511,7 @@ jobs:
           chmod 644 /etc/openclaw-lxc.env
 
           echo "=================================================="
-          echo "写入 OpenClaw 配置维护脚本"
+          echo "写入 OpenClaw 配置维护脚本：危险模式，放开所有工具"
           echo "=================================================="
 
           cat >/usr/local/sbin/openclaw-ensure-config <<'ENSURE_CONF'
@@ -581,9 +582,23 @@ jobs:
             .cli = (.cli // {}) |
             .cli.banner = (.cli.banner // {}) |
             .cli.banner.taglineMode = "off" |
+
+            # ============================================================
+            # 危险模式：
+            # 1. profile 使用 full
+            # 2. 删除 allow 白名单
+            # 3. 删除 deny 黑名单
+            # 4. openclaw-gateway.service 以 root 运行
+            #
+            # 效果：
+            # OpenClaw 如果模型和 OpenClaw 本身支持 shell/system/filesystem 工具，
+            # 将不再被 allow/deny 限制。
+            # ============================================================
             .tools = (.tools // {}) |
             .tools.profile = "full" |
-            .tools.allow = (((.tools.allow // []) | if type == "array" then . else [] end) + ["group:plugins"] | unique) |
+            del(.tools.allow) |
+            del(.tools.deny) |
+
             .mcp = (.mcp // {}) |
             .mcp.servers = (.mcp.servers // {}) |
             .mcp.servers.context7 = {
@@ -961,6 +976,11 @@ jobs:
             echo "Gateway Token:"
             echo "  ${TOKEN:-未生成}"
             echo
+            echo "权限模式:"
+            echo "  危险模式：OpenClaw Gateway 以 root 运行，tools.profile=full。"
+            echo "  已删除 tools.allow / tools.deny 限制。"
+            echo "  如果模型支持工具调用，它可以执行 shell / system / filesystem 等高危操作。"
+            echo
             echo "第一次使用:"
             echo "  1. 运行 openclaw-api-setup"
             echo "  2. 填写 Base URL、模型名称、API Key"
@@ -1023,7 +1043,7 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
           echo "============================================================"
-          echo "OpenClaw 插件"
+          echo "OpenClaw 插件 / 工具配置"
           echo "============================================================"
           openclaw mcp list || true
           echo
@@ -1107,12 +1127,14 @@ jobs:
 
           cat >/etc/systemd/system/openclaw-gateway.service <<'GATEWAY_SERVICE'
           [Unit]
-          Description=OpenClaw Gateway
+          Description=OpenClaw Gateway Dangerous Full Tools
           After=openclaw-disable-ipv6.service openclaw-net-up.service networking.service network-online.target openclaw-firstboot.service
           Wants=openclaw-disable-ipv6.service openclaw-net-up.service networking.service network-online.target openclaw-firstboot.service
 
           [Service]
           Type=simple
+          User=root
+          Group=root
           WorkingDirectory=/root
           EnvironmentFile=-/etc/openclaw-lxc.env
           EnvironmentFile=-/root/.openclaw/.env
@@ -1177,6 +1199,7 @@ jobs:
           sudo chroot "$ROOTFS" npm config get registry | grep -q "registry.npmmirror.com"
           sudo chroot "$ROOTFS" /usr/local/sbin/openclaw-ensure-config
           sudo chroot "$ROOTFS" jq empty /root/.openclaw/openclaw.json
+          sudo chroot "$ROOTFS" jq -e '.tools.profile == "full" and (.tools.allow? | not) and (.tools.deny? | not)' /root/.openclaw/openclaw.json
           sudo chroot "$ROOTFS" openclaw mcp list || true
 
           sudo rm -f "$ROOTFS/root/.openclaw/.env"
@@ -1239,12 +1262,16 @@ jobs:
           sudo test -f "$ROOTFS/etc/systemd/system/openclaw-firstboot.service"
           sudo test -f "$ROOTFS/etc/systemd/system/openclaw-gateway.service"
 
+          sudo grep -q "User=root" "$ROOTFS/etc/systemd/system/openclaw-gateway.service"
+          sudo grep -q "Group=root" "$ROOTFS/etc/systemd/system/openclaw-gateway.service"
+
           sudo grep -q "PasswordAuthentication yes" "$ROOTFS/etc/ssh/sshd_config.d/99-openclaw-lxc.conf"
           sudo grep -q "PermitRootLogin yes" "$ROOTFS/etc/ssh/sshd_config.d/99-openclaw-lxc.conf"
 
           sudo grep -q "mirrors.tuna.tsinghua.edu.cn" "$ROOTFS/etc/apt/sources.list" || sudo grep -q "mirrors.ustc.edu.cn" "$ROOTFS/etc/apt/sources.list"
           sudo grep -q "nameserver 223.5.5.5" "$ROOTFS/etc/resolv.conf"
           sudo jq empty "$ROOTFS/root/.openclaw/openclaw.json"
+          sudo jq -e '.tools.profile == "full" and (.tools.allow? | not) and (.tools.deny? | not)' "$ROOTFS/root/.openclaw/openclaw.json"
 
           if sudo grep -R "Gateway Password" "$ROOTFS/etc/profile.d" "$ROOTFS/usr/local/bin" "$ROOTFS/usr/local/sbin" >/dev/null 2>&1; then
             echo "错误：登录信息或脚本不应该显示 Gateway Password"
@@ -1274,7 +1301,7 @@ jobs:
           echo "=================================================="
 
           TAG="openclaw-lxc-${VERSION}"
-          TITLE="OpenClaw LXC ${VERSION}"
+          TITLE="OpenClaw LXC Dangerous Full Tools ${VERSION}"
 
           echo "Repository: $GITHUB_REPOSITORY"
           echo "Tag: $TAG"
@@ -1295,7 +1322,7 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "$TITLE" \
-              --notes "OpenClaw LXC template"
+              --notes "OpenClaw LXC template. Dangerous mode: full tools, root gateway, no tools.allow/tools.deny."
           fi
 
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY"
