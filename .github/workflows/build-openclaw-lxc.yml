@@ -166,7 +166,7 @@ jobs:
           apt-get update
 
           echo "=================================================="
-          echo "安装小白常用系统环境"
+          echo "安装常用系统环境"
           echo "=================================================="
 
           apt-get install -y \
@@ -316,7 +316,7 @@ jobs:
           echo "Asia/Shanghai" >/etc/timezone || true
 
           echo "=================================================="
-          echo "配置静态网络框架，不写 DHCP"
+          echo "配置静态网络"
           echo "=================================================="
 
           cat >/etc/network/interfaces <<'NET_CONF'
@@ -511,7 +511,7 @@ jobs:
           chmod 644 /etc/openclaw-lxc.env
 
           echo "=================================================="
-          echo "写入 OpenClaw 配置维护脚本：危险模式，放开所有工具"
+          echo "写入 OpenClaw 配置维护脚本"
           echo "=================================================="
 
           cat >/usr/local/sbin/openclaw-ensure-config <<'ENSURE_CONF'
