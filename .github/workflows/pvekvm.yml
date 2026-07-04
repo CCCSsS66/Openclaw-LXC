@@ -114,9 +114,6 @@ jobs:
           sudo chmod 666 /dev/kvm || true
           sudo rm -rf /var/tmp/.guestfs-* /tmp/.guestfs-* || true
 
-          echo "Available kernels:"
-          ls -lh /boot/vmlinuz-* || true
-
           echo "Testing libguestfs:"
           if ! sudo -E libguestfs-test-tool > /tmp/libguestfs-test-tool.log 2>&1; then
             cat /tmp/libguestfs-test-tool.log
@@ -148,7 +145,6 @@ jobs:
             local file
 
             html="$(curl -fsSL "${base_url}")"
-
             file="$(
               printf '%s\n' "${html}" \
                 | grep -oE 'href="[^"]+"' \
@@ -159,7 +155,7 @@ jobs:
                 | tail -n1
             )"
 
-            [[ -n "${file}" ]] || die "cannot resolve image from ${base_url} with pattern ${pattern}"
+            [[ -n "${file}" ]] || die "cannot resolve image from ${base_url}"
 
             if [[ "${file}" =~ ^https?:// ]]; then
               printf '%s\n' "${file}"
@@ -218,7 +214,6 @@ jobs:
           curl -fL --retry 5 --retry-delay 3 -o "${SOURCE_IMAGE}" "${IMAGE_URL}"
 
           if [[ "${SOURCE_IMAGE}" == *.xz ]]; then
-            echo "[${DISTRO}] Decompress xz"
             unxz -f "${SOURCE_IMAGE}"
             SOURCE_IMAGE="${SOURCE_IMAGE%.xz}"
           fi
@@ -231,633 +226,504 @@ jobs:
           PVE_OPENRC_SERVICE="${WORKDIR}/pve-static-network"
 
           cat > "${CLOUD_CFG}" <<'EOF'
-datasource_list: [ "NoCloud", "ConfigDrive", "None" ]
-disable_fallback_netcfg: true
-network:
-  config: disabled
-EOF
+          datasource_list: [ "NoCloud", "ConfigDrive", "None" ]
+          disable_fallback_netcfg: true
+          network:
+            config: disabled
+          EOF
 
           cat > "${SYSCTL_CFG}" <<'EOF'
-net.ipv6.conf.all.accept_ra = 0
-net.ipv6.conf.default.accept_ra = 0
-net.ipv6.conf.all.autoconf = 0
-net.ipv6.conf.default.autoconf = 0
-net.ipv6.conf.all.accept_redirects = 0
-net.ipv6.conf.default.accept_redirects = 0
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-EOF
+          net.ipv6.conf.all.accept_ra = 0
+          net.ipv6.conf.default.accept_ra = 0
+          net.ipv6.conf.all.autoconf = 0
+          net.ipv6.conf.default.autoconf = 0
+          net.ipv6.conf.all.accept_redirects = 0
+          net.ipv6.conf.default.accept_redirects = 0
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.default.accept_redirects = 0
+          EOF
 
           cat > "${NM_CFG}" <<'EOF'
-[main]
-no-auto-default=*
+          [main]
+          no-auto-default=*
 
-[device]
-unmanaged-devices=type:ethernet
-EOF
+          [device]
+          unmanaged-devices=type:ethernet
+          EOF
 
           cat > "${PVE_SYSTEMD_UNIT}" <<'EOF'
-[Unit]
-Description=Apply static-only PVE Cloud-Init network config without DHCP or IPv6 RA
-DefaultDependencies=no
-Wants=systemd-udev-settle.service
-After=local-fs.target systemd-udev-settle.service
-Before=network-pre.target network.target network-online.target NetworkManager.service systemd-networkd.service cloud-init-local.service cloud-init.service ssh.service sshd.service
+          [Unit]
+          Description=Apply static-only PVE Cloud-Init network config
+          DefaultDependencies=no
+          Wants=systemd-udev-settle.service
+          After=local-fs.target systemd-udev-settle.service
+          Before=network-pre.target network.target network-online.target NetworkManager.service systemd-networkd.service cloud-init-local.service cloud-init.service ssh.service sshd.service
 
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/pve-static-network.py
-RemainAfterExit=yes
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/pve-static-network.py
+          RemainAfterExit=yes
 
-[Install]
-WantedBy=sysinit.target
-EOF
+          [Install]
+          WantedBy=sysinit.target
+          EOF
 
           cat > "${PVE_OPENRC_SERVICE}" <<'EOF'
-#!/sbin/openrc-run
+          #!/sbin/openrc-run
 
-description="Apply static-only PVE Cloud-Init network config without DHCP or IPv6 RA"
+          description="Apply static-only PVE Cloud-Init network config"
 
-depend() {
-    need localmount
-    before networking
-}
+          depend() {
+              need localmount
+              before networking
+          }
 
-start() {
-    ebegin "Applying static-only PVE Cloud-Init network config"
-    /usr/local/sbin/pve-static-network.py
-    eend $?
-}
-EOF
+          start() {
+              ebegin "Applying static-only PVE Cloud-Init network config"
+              /usr/local/sbin/pve-static-network.py
+              eend $?
+          }
+          EOF
 
           cat > "${PVE_NET_SCRIPT}" <<'PYEOF'
-#!/usr/bin/env python3
-import glob
-import ipaddress
-import json
-import os
-import re
-import shutil
-import subprocess
-import sys
-import tempfile
-from datetime import datetime
-
-LOG_PATH = "/var/log/pve-static-network.log"
-
-
-def log(msg):
-    line = f"{datetime.utcnow().isoformat()}Z {msg}"
-    print(line)
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
-
-
-def find_cmd(name):
-    found = shutil.which(name)
-    if found:
-        return found
-    for path in [f"/sbin/{name}", f"/usr/sbin/{name}", f"/bin/{name}", f"/usr/bin/{name}"]:
-        if os.path.exists(path):
-            return path
-    return name
-
-
-IP = find_cmd("ip")
-MOUNT = find_cmd("mount")
-UMOUNT = find_cmd("umount")
-BLKID = find_cmd("blkid")
-
-
-def run(cmd):
-    log("+ " + " ".join(str(x) for x in cmd))
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if proc.stdout.strip():
-        log(proc.stdout.strip())
-    if proc.stderr.strip():
-        log(proc.stderr.strip())
-    return proc.returncode
-
-
-def write_proc(path, value):
-    try:
-        if os.path.exists(path):
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(str(value))
-    except Exception as exc:
-        log(f"skip write {path}: {exc}")
-
-
-def disable_auto_ipv6(iface=None):
-    names = ["all", "default"]
-    if iface:
-        names.append(iface)
-
-    for name in names:
-        write_proc(f"/proc/sys/net/ipv6/conf/{name}/accept_ra", "0")
-        write_proc(f"/proc/sys/net/ipv6/conf/{name}/autoconf", "0")
-        write_proc(f"/proc/sys/net/ipv6/conf/{name}/accept_redirects", "0")
-        write_proc(f"/proc/sys/net/ipv4/conf/{name}/accept_redirects", "0")
-
-
-def normalize_mac(mac):
-    if not mac:
-        return None
-    return str(mac).strip().lower().replace("-", ":")
-
-
-def get_ifaces():
-    out = {}
-    for path in sorted(glob.glob("/sys/class/net/*")):
-        name = os.path.basename(path)
-        if name == "lo":
-            continue
-
-        mac = None
-        try:
-            with open(os.path.join(path, "address"), encoding="utf-8") as f:
-                mac = normalize_mac(f.read())
-        except Exception:
-            pass
-
-        out[name] = mac
-
-    return out
-
-
-def read_text(path):
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
-
-
-def unique(values):
-    out = []
-    seen = set()
-
-    for value in values:
-        if value is None:
-            continue
-        value = str(value).strip().strip("'").strip('"')
-        if value and value not in seen:
-            seen.add(value)
-            out.append(value)
-
-    return out
-
-
-def candidate_devices():
-    out = []
-
-    for label in ["cidata", "CIDATA", "config-2", "CONFIG-2"]:
-        by_label = f"/dev/disk/by-label/{label}"
-
-        if os.path.exists(by_label):
-            out.append(os.path.realpath(by_label))
-
-        try:
-            proc = subprocess.run([BLKID, "-L", label], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-            if proc.returncode == 0 and proc.stdout.strip():
-                out.append(proc.stdout.strip())
-        except Exception:
-            pass
-
-    return unique(out)
-
-
-def find_network_config():
-    paths = [
-        "/var/lib/cloud/seed/nocloud-net/network-config",
-        "/var/lib/cloud/seed/nocloud/network-config",
-        "/var/lib/cloud/seed/config_drive/openstack/latest/network-config",
-        "/var/lib/cloud/seed/config_drive/openstack/latest/network_data.json",
-    ]
-
-    for path in paths:
-        if os.path.exists(path):
-            text = read_text(path)
-            if text.strip():
-                log(f"found network config: {path}")
-                return path, text
-
-    for dev in candidate_devices():
-        with tempfile.TemporaryDirectory(prefix="pve-cidata-") as mnt:
-            if run([MOUNT, "-o", "ro", dev, mnt]) != 0:
-                continue
-
-            try:
-                for rel in ["network-config", "openstack/latest/network-config", "openstack/latest/network_data.json"]:
-                    path = os.path.join(mnt, rel)
-                    if os.path.exists(path):
-                        text = read_text(path)
-                        if text.strip():
-                            log(f"found network config on {dev}: {rel}")
-                            return path, text
-            finally:
-                run([UMOUNT, mnt])
-
-    return None, None
-
-
-def prefix_from_netmask(mask, family):
-    if not mask:
-        return 128 if family == 6 else 32
-
-    mask = str(mask).strip()
-
-    if mask.isdigit():
-        return int(mask)
-
-    if family == 4:
-        return ipaddress.IPv4Network("0.0.0.0/" + mask, strict=False).prefixlen
-
-    return int(mask)
-
-
-def normalize_addr(addr, mask=None, family=None):
-    if not addr:
-        return None
-
-    addr = str(addr).strip().strip("'").strip('"')
-
-    if "/" in addr:
-        return addr
-
-    if family is None:
-        family = 6 if ":" in addr else 4
-
-    return f"{addr}/{prefix_from_netmask(mask, family)}"
-
-
-def empty_entry(name=None, mac=None):
-    return {
-        "name": name,
-        "mac": normalize_mac(mac),
-        "addresses": [],
-        "gateway4": None,
-        "gateway6": None,
-        "dns": [],
-        "search": [],
-    }
-
-
-def parse_v1(data):
-    entries = []
-    global_dns = []
-    global_search = []
-
-    for item in data.get("config") or []:
-        if not isinstance(item, dict):
-            continue
-
-        typ = str(item.get("type", "")).lower()
-
-        if typ == "nameserver":
-            dns = item.get("address") or item.get("addresses") or []
-            if isinstance(dns, str):
-                dns = [dns]
-            global_dns.extend(dns)
-
-            search = item.get("search") or []
-            if isinstance(search, str):
-                search = [search]
-            global_search.extend(search)
-            continue
-
-        if typ != "physical":
-            continue
-
-        entry = empty_entry(item.get("name"), item.get("mac_address") or item.get("mac"))
-
-        for subnet in item.get("subnets") or []:
-            if not isinstance(subnet, dict):
-                continue
-
-            stype = str(subnet.get("type", "")).lower()
-
-            if stype in ["dhcp", "dhcp4", "dhcp6"]:
-                log(f"ignore DHCP subnet on {entry['name']}")
-                continue
-
-            if stype in ["static", "static4", "ipv4"]:
-                family = 4
-            elif stype in ["static6", "ipv6"]:
-                family = 6
-            else:
-                continue
-
-            addr = normalize_addr(subnet.get("address"), subnet.get("netmask"), family)
-            if addr:
-                entry["addresses"].append(addr)
-
-            gateway = subnet.get("gateway")
-            if gateway:
-                if family == 6:
-                    entry["gateway6"] = str(gateway)
-                else:
-                    entry["gateway4"] = str(gateway)
-
-            dns = subnet.get("dns_nameservers") or subnet.get("dns") or []
-            if isinstance(dns, str):
-                dns = [dns]
-            entry["dns"].extend(dns)
-
-            search = subnet.get("dns_search") or []
-            if isinstance(search, str):
-                search = [search]
-            entry["search"].extend(search)
-
-        entries.append(entry)
-
-    for entry in entries:
-        entry["dns"].extend(global_dns)
-        entry["search"].extend(global_search)
-
-    return entries
-
-
-def parse_v2(data):
-    entries = []
-    ethernets = data.get("ethernets") or {}
-
-    if not isinstance(ethernets, dict):
-        return entries
-
-    for name, cfg in ethernets.items():
-        if not isinstance(cfg, dict):
-            continue
-
-        match = cfg.get("match") or {}
-        entry = empty_entry(name, match.get("macaddress") or match.get("mac_address"))
-
-        if cfg.get("dhcp4") or cfg.get("dhcp6"):
-            log(f"ignore DHCP request on {name}")
-
-        addresses = cfg.get("addresses") or []
-        if isinstance(addresses, str):
-            addresses = [addresses]
-        entry["addresses"].extend(addresses)
-
-        if cfg.get("gateway4"):
-            entry["gateway4"] = str(cfg.get("gateway4"))
-        if cfg.get("gateway6"):
-            entry["gateway6"] = str(cfg.get("gateway6"))
-
-        nameservers = cfg.get("nameservers") or {}
-
-        dns = nameservers.get("addresses") or []
-        if isinstance(dns, str):
-            dns = [dns]
-        entry["dns"].extend(dns)
-
-        search = nameservers.get("search") or []
-        if isinstance(search, str):
-            search = [search]
-        entry["search"].extend(search)
-
-        entries.append(entry)
-
-    return entries
-
-
-def parse_openstack_json(text):
-    entries = []
-
-    try:
-        data = json.loads(text)
-    except Exception as exc:
-        log(f"json parse failed: {exc}")
-        return entries
-
-    links = {}
-    for link in data.get("links") or []:
-        if not isinstance(link, dict):
-            continue
-        link_id = link.get("id")
-        if not link_id:
-            continue
-        links[link_id] = {
-            "name": link.get("name") or link_id,
-            "mac": normalize_mac(link.get("ethernet_mac_address") or link.get("mac_address")),
-        }
-
-    by_link = {}
-
-    for net in data.get("networks") or []:
-        if not isinstance(net, dict):
-            continue
-
-        ntype = str(net.get("type", "")).lower()
-
-        if "dhcp" in ntype:
-            log(f"ignore DHCP network on link {net.get('link')}")
-            continue
-
-        link_id = net.get("link")
-        info = links.get(link_id, {"name": link_id, "mac": None})
-
-        if link_id not in by_link:
-            by_link[link_id] = empty_entry(info.get("name"), info.get("mac"))
-
-        entry = by_link[link_id]
-        family = 6 if "ipv6" in ntype else 4
-
-        addr = net.get("ip_address") or net.get("address")
-        prefix = net.get("netmask") or net.get("prefix")
-        naddr = normalize_addr(addr, prefix, family)
-        if naddr:
-            entry["addresses"].append(naddr)
-
-        gateway = net.get("gateway")
-        if gateway:
-            if family == 6:
-                entry["gateway6"] = str(gateway)
-            else:
-                entry["gateway4"] = str(gateway)
-
-    dns = []
-    for service in data.get("services") or []:
-        if isinstance(service, dict) and str(service.get("type", "")).lower() == "dns":
-            if service.get("address"):
-                dns.append(service.get("address"))
-
-    entries = list(by_link.values())
-    if dns:
-        for entry in entries:
-            entry["dns"].extend(dns)
-
-    return entries
-
-
-def parse_config(path, text):
-    if path and path.endswith(".json"):
-        return parse_openstack_json(text)
-
-    try:
-        import yaml
-    except Exception as exc:
-        log(f"missing yaml module: {exc}")
-        return []
-
-    try:
-        data = yaml.safe_load(text)
-    except Exception as exc:
-        log(f"yaml parse failed: {exc}")
-        return []
-
-    if not isinstance(data, dict):
-        return []
-
-    if isinstance(data.get("network"), dict):
-        data = data["network"]
-
-    version = str(data.get("version", ""))
-
-    if version == "1":
-        return parse_v1(data)
-
-    if version == "2" or "ethernets" in data:
-        return parse_v2(data)
-
-    return []
-
-
-def resolve_iface(entry, ifaces):
-    mac = normalize_mac(entry.get("mac"))
-
-    if mac:
-        for name, iface_mac in ifaces.items():
-            if iface_mac == mac:
-                return name
-
-    name = entry.get("name")
-
-    if name in ifaces:
-        return name
-
-    if name:
-        match = re.match(r"eth(\d+)$", str(name))
-        if match:
-            idx = int(match.group(1))
-            names = sorted(ifaces.keys())
-            if idx < len(names):
-                return names[idx]
-
-    if len(ifaces) == 1:
-        return next(iter(ifaces.keys()))
-
-    return None
-
-
-def is_ipv6(addr):
-    return ":" in str(addr).split("/")[0]
-
-
-def apply_dns(dns, search):
-    dns = unique(dns)
-    search = unique(search)
-
-    if not dns and not search:
-        return
-
-    lines = [
-        "# Generated by pve-static-network.py",
-        "# DHCP is intentionally disabled.",
-    ]
-
-    if search:
-        lines.append("search " + " ".join(search))
-
-    for nameserver in dns:
-        lines.append("nameserver " + nameserver)
-
-    try:
-        if os.path.islink("/etc/resolv.conf"):
-            os.unlink("/etc/resolv.conf")
-
-        with open("/etc/resolv.conf", "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-
-        log("updated /etc/resolv.conf")
-    except Exception as exc:
-        log(f"failed to update resolv.conf: {exc}")
-
-
-def apply_entry(entry, iface):
-    addresses = unique(entry.get("addresses") or [])
-
-    if not addresses:
-        log(f"{iface}: no static address; skip")
-        return False
-
-    disable_auto_ipv6(iface)
-
-    run([IP, "link", "set", "dev", iface, "up"])
-    run([IP, "addr", "flush", "dev", iface, "scope", "global"])
-
-    for addr in addresses:
-        if is_ipv6(addr):
-            run([IP, "-6", "addr", "add", addr, "dev", iface])
-        else:
-            run([IP, "-4", "addr", "add", addr, "dev", iface])
-
-    if entry.get("gateway4"):
-        run([IP, "-4", "route", "replace", "default", "via", entry["gateway4"], "dev", iface])
-
-    if entry.get("gateway6"):
-        run([IP, "-6", "route", "replace", "default", "via", entry["gateway6"], "dev", iface])
-
-    return True
-
-
-def main():
-    log("start static-only PVE network setup")
-    disable_auto_ipv6()
-
-    path, text = find_network_config()
-    if not text:
-        log("no PVE network config found; DHCP will not be started")
-        return 0
-
-    entries = parse_config(path, text)
-    if not entries:
-        log("no usable static network entries found; DHCP entries ignored")
-        return 0
-
-    ifaces = get_ifaces()
-    if not ifaces:
-        log("no ethernet interfaces found")
-        return 0
-
-    applied = False
-    all_dns = []
-    all_search = []
-
-    for entry in entries:
-        iface = resolve_iface(entry, ifaces)
-        if not iface:
-            log(f"cannot resolve interface for {entry}")
-            continue
-
-        if apply_entry(entry, iface):
-            applied = True
-            all_dns.extend(entry.get("dns") or [])
-            all_search.extend(entry.get("search") or [])
-
-    if applied:
-        apply_dns(all_dns, all_search)
-        log("static PVE network config applied")
-    else:
-        log("nothing applied; DHCP remains disabled")
-
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-PYEOF
+          #!/usr/bin/env python3
+          import glob
+          import ipaddress
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          from datetime import datetime
+
+          LOG_PATH = "/var/log/pve-static-network.log"
+
+          def log(msg):
+              line = f"{datetime.utcnow().isoformat()}Z {msg}"
+              print(line)
+              try:
+                  with open(LOG_PATH, "a", encoding="utf-8") as f:
+                      f.write(line + "\n")
+              except Exception:
+                  pass
+
+          def find_cmd(name):
+              found = shutil.which(name)
+              if found:
+                  return found
+              for path in [f"/sbin/{name}", f"/usr/sbin/{name}", f"/bin/{name}", f"/usr/bin/{name}"]:
+                  if os.path.exists(path):
+                      return path
+              return name
+
+          IP = find_cmd("ip")
+          MOUNT = find_cmd("mount")
+          UMOUNT = find_cmd("umount")
+          BLKID = find_cmd("blkid")
+
+          def run(cmd):
+              log("+ " + " ".join(str(x) for x in cmd))
+              proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              if proc.stdout.strip():
+                  log(proc.stdout.strip())
+              if proc.stderr.strip():
+                  log(proc.stderr.strip())
+              return proc.returncode
+
+          def write_proc(path, value):
+              try:
+                  if os.path.exists(path):
+                      with open(path, "w", encoding="utf-8") as f:
+                          f.write(str(value))
+              except Exception as exc:
+                  log(f"skip write {path}: {exc}")
+
+          def disable_auto_ipv6(iface=None):
+              names = ["all", "default"]
+              if iface:
+                  names.append(iface)
+              for name in names:
+                  write_proc(f"/proc/sys/net/ipv6/conf/{name}/accept_ra", "0")
+                  write_proc(f"/proc/sys/net/ipv6/conf/{name}/autoconf", "0")
+                  write_proc(f"/proc/sys/net/ipv6/conf/{name}/accept_redirects", "0")
+                  write_proc(f"/proc/sys/net/ipv4/conf/{name}/accept_redirects", "0")
+
+          def normalize_mac(mac):
+              if not mac:
+                  return None
+              return str(mac).strip().lower().replace("-", ":")
+
+          def get_ifaces():
+              out = {}
+              for path in sorted(glob.glob("/sys/class/net/*")):
+                  name = os.path.basename(path)
+                  if name == "lo":
+                      continue
+                  mac = None
+                  try:
+                      with open(os.path.join(path, "address"), encoding="utf-8") as f:
+                          mac = normalize_mac(f.read())
+                  except Exception:
+                      pass
+                  out[name] = mac
+              return out
+
+          def read_text(path):
+              with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                  return f.read()
+
+          def unique(values):
+              out = []
+              seen = set()
+              for value in values:
+                  if value is None:
+                      continue
+                  value = str(value).strip().strip("'").strip('"')
+                  if value and value not in seen:
+                      seen.add(value)
+                      out.append(value)
+              return out
+
+          def candidate_devices():
+              out = []
+              for label in ["cidata", "CIDATA", "config-2", "CONFIG-2"]:
+                  by_label = f"/dev/disk/by-label/{label}"
+                  if os.path.exists(by_label):
+                      out.append(os.path.realpath(by_label))
+                  try:
+                      proc = subprocess.run([BLKID, "-L", label], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                      if proc.returncode == 0 and proc.stdout.strip():
+                          out.append(proc.stdout.strip())
+                  except Exception:
+                      pass
+              return unique(out)
+
+          def find_network_config():
+              paths = [
+                  "/var/lib/cloud/seed/nocloud-net/network-config",
+                  "/var/lib/cloud/seed/nocloud/network-config",
+                  "/var/lib/cloud/seed/config_drive/openstack/latest/network-config",
+              ]
+              for path in paths:
+                  if os.path.exists(path):
+                      text = read_text(path)
+                      if text.strip():
+                          log(f"found network config: {path}")
+                          return text
+
+              for dev in candidate_devices():
+                  with tempfile.TemporaryDirectory(prefix="pve-cidata-") as mnt:
+                      if run([MOUNT, "-o", "ro", dev, mnt]) != 0:
+                          continue
+                      try:
+                          for rel in ["network-config", "openstack/latest/network-config"]:
+                              path = os.path.join(mnt, rel)
+                              if os.path.exists(path):
+                                  text = read_text(path)
+                                  if text.strip():
+                                      log(f"found network config on {dev}: {rel}")
+                                      return text
+                      finally:
+                          run([UMOUNT, mnt])
+              return None
+
+          def prefix_from_netmask(mask, family):
+              if not mask:
+                  return 128 if family == 6 else 32
+              mask = str(mask).strip()
+              if mask.isdigit():
+                  return int(mask)
+              if family == 4:
+                  return ipaddress.IPv4Network("0.0.0.0/" + mask, strict=False).prefixlen
+              return int(mask)
+
+          def normalize_addr(addr, mask=None, family=None):
+              if not addr:
+                  return None
+              addr = str(addr).strip().strip("'").strip('"')
+              if "/" in addr:
+                  return addr
+              if family is None:
+                  family = 6 if ":" in addr else 4
+              return f"{addr}/{prefix_from_netmask(mask, family)}"
+
+          def empty_entry(name=None, mac=None):
+              return {
+                  "name": name,
+                  "mac": normalize_mac(mac),
+                  "addresses": [],
+                  "gateway4": None,
+                  "gateway6": None,
+                  "dns": [],
+                  "search": [],
+              }
+
+          def parse_v1(data):
+              entries = []
+              global_dns = []
+              global_search = []
+
+              for item in data.get("config") or []:
+                  if not isinstance(item, dict):
+                      continue
+
+                  typ = str(item.get("type", "")).lower()
+
+                  if typ == "nameserver":
+                      dns = item.get("address") or item.get("addresses") or []
+                      if isinstance(dns, str):
+                          dns = [dns]
+                      global_dns.extend(dns)
+
+                      search = item.get("search") or []
+                      if isinstance(search, str):
+                          search = [search]
+                      global_search.extend(search)
+                      continue
+
+                  if typ != "physical":
+                      continue
+
+                  entry = empty_entry(item.get("name"), item.get("mac_address") or item.get("mac"))
+
+                  for subnet in item.get("subnets") or []:
+                      if not isinstance(subnet, dict):
+                          continue
+
+                      stype = str(subnet.get("type", "")).lower()
+                      if stype in ["dhcp", "dhcp4", "dhcp6"]:
+                          log(f"ignore DHCP subnet on {entry['name']}")
+                          continue
+
+                      if stype in ["static", "static4", "ipv4"]:
+                          family = 4
+                      elif stype in ["static6", "ipv6"]:
+                          family = 6
+                      else:
+                          continue
+
+                      addr = normalize_addr(subnet.get("address"), subnet.get("netmask"), family)
+                      if addr:
+                          entry["addresses"].append(addr)
+
+                      gateway = subnet.get("gateway")
+                      if gateway:
+                          if family == 6:
+                              entry["gateway6"] = str(gateway)
+                          else:
+                              entry["gateway4"] = str(gateway)
+
+                      dns = subnet.get("dns_nameservers") or subnet.get("dns") or []
+                      if isinstance(dns, str):
+                          dns = [dns]
+                      entry["dns"].extend(dns)
+
+                      search = subnet.get("dns_search") or []
+                      if isinstance(search, str):
+                          search = [search]
+                      entry["search"].extend(search)
+
+                  entries.append(entry)
+
+              for entry in entries:
+                  entry["dns"].extend(global_dns)
+                  entry["search"].extend(global_search)
+
+              return entries
+
+          def parse_v2(data):
+              entries = []
+              ethernets = data.get("ethernets") or {}
+
+              if not isinstance(ethernets, dict):
+                  return entries
+
+              for name, cfg in ethernets.items():
+                  if not isinstance(cfg, dict):
+                      continue
+
+                  match = cfg.get("match") or {}
+                  entry = empty_entry(name, match.get("macaddress") or match.get("mac_address"))
+
+                  if cfg.get("dhcp4") or cfg.get("dhcp6"):
+                      log(f"ignore DHCP request on {name}")
+
+                  addresses = cfg.get("addresses") or []
+                  if isinstance(addresses, str):
+                      addresses = [addresses]
+                  entry["addresses"].extend(addresses)
+
+                  if cfg.get("gateway4"):
+                      entry["gateway4"] = str(cfg.get("gateway4"))
+                  if cfg.get("gateway6"):
+                      entry["gateway6"] = str(cfg.get("gateway6"))
+
+                  nameservers = cfg.get("nameservers") or {}
+
+                  dns = nameservers.get("addresses") or []
+                  if isinstance(dns, str):
+                      dns = [dns]
+                  entry["dns"].extend(dns)
+
+                  search = nameservers.get("search") or []
+                  if isinstance(search, str):
+                      search = [search]
+                  entry["search"].extend(search)
+
+                  entries.append(entry)
+
+              return entries
+
+          def parse_config(text):
+              try:
+                  import yaml
+              except Exception as exc:
+                  log(f"missing yaml module: {exc}")
+                  return []
+
+              try:
+                  data = yaml.safe_load(text)
+              except Exception as exc:
+                  log(f"yaml parse failed: {exc}")
+                  return []
+
+              if not isinstance(data, dict):
+                  return []
+
+              if isinstance(data.get("network"), dict):
+                  data = data["network"]
+
+              version = str(data.get("version", ""))
+
+              if version == "1":
+                  return parse_v1(data)
+              if version == "2" or "ethernets" in data:
+                  return parse_v2(data)
+              return []
+
+          def resolve_iface(entry, ifaces):
+              mac = normalize_mac(entry.get("mac"))
+              if mac:
+                  for name, iface_mac in ifaces.items():
+                      if iface_mac == mac:
+                          return name
+
+              name = entry.get("name")
+              if name in ifaces:
+                  return name
+
+              if name:
+                  match = re.match(r"eth(\d+)$", str(name))
+                  if match:
+                      idx = int(match.group(1))
+                      names = sorted(ifaces.keys())
+                      if idx < len(names):
+                          return names[idx]
+
+              if len(ifaces) == 1:
+                  return next(iter(ifaces.keys()))
+
+              return None
+
+          def is_ipv6(addr):
+              return ":" in str(addr).split("/")[0]
+
+          def apply_dns(dns, search):
+              dns = unique(dns)
+              search = unique(search)
+              if not dns and not search:
+                  return
+
+              lines = [
+                  "# Generated by pve-static-network.py",
+                  "# DHCP is intentionally disabled.",
+              ]
+
+              if search:
+                  lines.append("search " + " ".join(search))
+
+              for nameserver in dns:
+                  lines.append("nameserver " + nameserver)
+
+              try:
+                  if os.path.islink("/etc/resolv.conf"):
+                      os.unlink("/etc/resolv.conf")
+                  with open("/etc/resolv.conf", "w", encoding="utf-8") as f:
+                      f.write("\n".join(lines) + "\n")
+                  log("updated /etc/resolv.conf")
+              except Exception as exc:
+                  log(f"failed to update resolv.conf: {exc}")
+
+          def apply_entry(entry, iface):
+              addresses = unique(entry.get("addresses") or [])
+              if not addresses:
+                  log(f"{iface}: no static address; skip")
+                  return False
+
+              disable_auto_ipv6(iface)
+              run([IP, "link", "set", "dev", iface, "up"])
+              run([IP, "addr", "flush", "dev", iface, "scope", "global"])
+
+              for addr in addresses:
+                  if is_ipv6(addr):
+                      run([IP, "-6", "addr", "add", addr, "dev", iface])
+                  else:
+                      run([IP, "-4", "addr", "add", addr, "dev", iface])
+
+              if entry.get("gateway4"):
+                  run([IP, "-4", "route", "replace", "default", "via", entry["gateway4"], "dev", iface])
+
+              if entry.get("gateway6"):
+                  run([IP, "-6", "route", "replace", "default", "via", entry["gateway6"], "dev", iface])
+
+              return True
+
+          def main():
+              log("start static-only PVE network setup")
+              disable_auto_ipv6()
+
+              text = find_network_config()
+              if not text:
+                  log("no PVE network config found; DHCP will not be started")
+                  return 0
+
+              entries = parse_config(text)
+              if not entries:
+                  log("no usable static network entries found; DHCP entries ignored")
+                  return 0
+
+              ifaces = get_ifaces()
+              if not ifaces:
+                  log("no ethernet interfaces found")
+                  return 0
+
+              applied = False
+              all_dns = []
+              all_search = []
+
+              for entry in entries:
+                  iface = resolve_iface(entry, ifaces)
+                  if not iface:
+                      log(f"cannot resolve interface for {entry}")
+                      continue
+
+                  if apply_entry(entry, iface):
+                      applied = True
+                      all_dns.extend(entry.get("dns") or [])
+                      all_search.extend(entry.get("search") or [])
+
+              if applied:
+                  apply_dns(all_dns, all_search)
+                  log("static PVE network config applied")
+              else:
+                  log("nothing applied; DHCP remains disabled")
+
+              return 0
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
 
           COMMON_ARGS=(
             --no-network
@@ -876,7 +742,7 @@ PYEOF
             --run-command 'rm -f /var/lib/dbus/machine-id || true'
           )
 
-          MASK_WAIT_ONLINE_COMMANDS=(
+          MASK_WAIT_ONLINE_ARGS=(
             --run-command 'systemctl disable systemd-networkd-wait-online.service NetworkManager-wait-online.service ifupdown-wait-online.service nm-cloud-setup.service nm-cloud-setup.timer || true'
             --run-command 'systemctl mask systemd-networkd-wait-online.service NetworkManager-wait-online.service ifupdown-wait-online.service nm-cloud-setup.service nm-cloud-setup.timer || true'
             --run-command 'mkdir -p /etc/systemd/system || true'
@@ -908,7 +774,7 @@ PYEOF
               --run-command 'rm -f /etc/NetworkManager/system-connections/*.nmconnection || true'
               --run-command 'mkdir -p /etc/systemd/system/sysinit.target.wants && ln -sf ../pve-static-network.service /etc/systemd/system/sysinit.target.wants/pve-static-network.service || true'
               --run-command 'systemctl enable qemu-guest-agent.service || true'
-              "${MASK_WAIT_ONLINE_COMMANDS[@]}"
+              "${MASK_WAIT_ONLINE_ARGS[@]}"
             )
           elif [[ "${FAMILY}" == "rhel" ]]; then
             EXTRA_ARGS=(
@@ -923,7 +789,7 @@ PYEOF
               --run-command 'rm -f /etc/sysconfig/network-scripts/ifcfg-enx* || true'
               --run-command 'mkdir -p /etc/systemd/system/sysinit.target.wants && ln -sf ../pve-static-network.service /etc/systemd/system/sysinit.target.wants/pve-static-network.service || true'
               --run-command 'systemctl enable qemu-guest-agent.service || true'
-              "${MASK_WAIT_ONLINE_COMMANDS[@]}"
+              "${MASK_WAIT_ONLINE_ARGS[@]}"
             )
           elif [[ "${FAMILY}" == "alpine" ]]; then
             EXTRA_ARGS=(
@@ -934,7 +800,6 @@ PYEOF
               --run-command 'printf "%s\n" "auto lo" "iface lo inet loopback" "source /etc/network/interfaces.d/*" > /etc/network/interfaces || true'
               --run-command 'chmod 0755 /etc/init.d/pve-static-network || true'
               --run-command 'mkdir -p /etc/runlevels/boot && ln -sf /etc/init.d/pve-static-network /etc/runlevels/boot/pve-static-network || true'
-              --run-command 'mkdir -p /etc/runlevels/boot && ln -sf /etc/init.d/sysctl /etc/runlevels/boot/sysctl || true'
             )
           else
             die "unknown family: ${FAMILY}"
@@ -999,7 +864,6 @@ PYEOF
             - DHCP from PVE Cloud-Init is ignored.
             - Only static IP configuration from PVE Cloud-Init is applied by pve-static-network.
             - IPv6 RA/SLAAC from router is disabled.
-            - Router-assigned IPv6 is blocked.
             - wait-online services are disabled and masked to avoid boot hanging.
             - If PVE does not provide a static IP, the VM should not automatically obtain IPv4 or IPv6 from router DHCP/RA.
 
