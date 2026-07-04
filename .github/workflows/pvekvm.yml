@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       distros:
-        description: "要构建的系统，逗号分隔：debian,ubuntu,centos,almalinux,rockylinux,alpine"
+        description: "Comma-separated: debian,ubuntu,centos,almalinux,rockylinux,alpine"
         required: false
         default: "debian,ubuntu,centos,almalinux,rockylinux,alpine"
       release_tag:
-        description: "发布 tag，留空则自动生成 pve-cloudinit-${run_number}"
+        description: "Release tag, empty = pve-cloudinit-${run_number}"
         required: false
         default: ""
   push:
@@ -41,30 +41,30 @@ jobs:
 
           matrix="$(
             RAW="$raw" ALLOWED="$allowed" python3 - <<'PY'
-          import json
-          import os
-          import sys
+import json
+import os
+import sys
 
-          raw = os.environ["RAW"]
-          allowed = os.environ["ALLOWED"].split()
-          requested = []
+raw = os.environ["RAW"]
+allowed = os.environ["ALLOWED"].split()
+requested = []
 
-          for item in raw.split(","):
-              name = item.strip().lower()
-              if not name:
-                  continue
-              if name not in allowed:
-                  print(f"unsupported distro: {name}", file=sys.stderr)
-                  sys.exit(1)
-              if name not in requested:
-                  requested.append(name)
+for item in raw.split(","):
+    name = item.strip().lower()
+    if not name:
+        continue
+    if name not in allowed:
+        print(f"unsupported distro: {name}", file=sys.stderr)
+        sys.exit(1)
+    if name not in requested:
+        requested.append(name)
 
-          if not requested:
-              print("no distro selected", file=sys.stderr)
-              sys.exit(1)
+if not requested:
+    print("no distro selected", file=sys.stderr)
+    sys.exit(1)
 
-          print(json.dumps({"include": [{"distro": name} for name in requested]}, separators=(",", ":")))
-          PY
+print(json.dumps({"include": [{"distro": name} for name in requested]}, separators=(",", ":")))
+PY
           )"
 
           if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
@@ -79,7 +79,7 @@ jobs:
           echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
           echo "release_name=PVE KVM CloudInit Images ${release_tag}" >> "$GITHUB_OUTPUT"
 
-          echo "Build matrix: ${matrix}"
+          echo "Matrix: ${matrix}"
           echo "Release tag: ${release_tag}"
 
   build:
@@ -95,22 +95,40 @@ jobs:
       LIBGUESTFS_BACKEND: direct
 
     steps:
-      - name: Install build dependencies
+      - name: Install build dependencies and fix libguestfs
         shell: bash
         run: |
           set -euo pipefail
+
           sudo apt-get update
           sudo apt-get install -y \
             ca-certificates \
             curl \
+            gawk \
             grep \
             libguestfs-tools \
+            linux-image-generic \
             qemu-utils \
             xz-utils
+
+          sudo chmod 0644 /boot/vmlinuz-* /boot/initrd.img-* || true
           sudo chmod 666 /dev/kvm || true
+          sudo rm -rf /var/tmp/.guestfs-* /tmp/.guestfs-* || true
+
+          echo "Available kernels:"
+          ls -lh /boot/vmlinuz-* || true
+
+          echo "Testing libguestfs:"
+          if ! sudo -E libguestfs-test-tool > /tmp/libguestfs-test-tool.log 2>&1; then
+            cat /tmp/libguestfs-test-tool.log
+            exit 1
+          fi
 
       - name: Build ${{ matrix.distro }} image
         shell: bash
+        env:
+          LIBGUESTFS_DEBUG: "1"
+          LIBGUESTFS_TRACE: "1"
         run: |
           set -euo pipefail
 
@@ -159,42 +177,36 @@ jobs:
               FAMILY="debian"
               BASE_URL="https://cloud.debian.org/images/cloud/bookworm/latest/"
               PATTERN='debian-12-genericcloud-amd64\.qcow2$'
-              PKGS="cloud-init,qemu-guest-agent"
               OUTPUT_BASENAME="debian-12-bookworm-pve-cloudinit"
               ;;
             ubuntu)
               FAMILY="debian"
               BASE_URL="https://cloud-images.ubuntu.com/noble/current/"
               PATTERN='noble-server-cloudimg-amd64\.img$'
-              PKGS="cloud-init,qemu-guest-agent"
               OUTPUT_BASENAME="ubuntu-24.04-noble-pve-cloudinit"
               ;;
             centos)
               FAMILY="rhel"
               BASE_URL="https://cloud.centos.org/centos/9-stream/x86_64/images/"
               PATTERN='CentOS-Stream-GenericCloud-9-latest\.x86_64\.qcow2$'
-              PKGS="cloud-init,qemu-guest-agent"
               OUTPUT_BASENAME="centos-stream-9-pve-cloudinit"
               ;;
             almalinux)
               FAMILY="rhel"
               BASE_URL="https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/"
               PATTERN='AlmaLinux-9.*x86_64\.qcow2$'
-              PKGS="cloud-init,qemu-guest-agent"
               OUTPUT_BASENAME="almalinux-9-pve-cloudinit"
               ;;
             rockylinux)
               FAMILY="rhel"
               BASE_URL="https://download.rockylinux.org/pub/rocky/9/images/x86_64/"
               PATTERN='Rocky-9.*x86_64\.qcow2$'
-              PKGS="cloud-init,qemu-guest-agent"
               OUTPUT_BASENAME="rockylinux-9-pve-cloudinit"
               ;;
             alpine)
               FAMILY="alpine"
               BASE_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/cloud/"
               PATTERN='alpine-.*-x86_64-bios-cloudinit-r[0-9]+\.qcow2(\.xz)?$'
-              PKGS="cloud-init,qemu-guest-agent,openssh"
               OUTPUT_BASENAME="alpine-latest-stable-pve-cloudinit"
               ;;
             *)
@@ -206,11 +218,11 @@ jobs:
           SOURCE_NAME="$(basename "${IMAGE_URL%%\?*}")"
           SOURCE_IMAGE="${WORKDIR}/${SOURCE_NAME}"
 
-          echo "[${DISTRO}] download: ${IMAGE_URL}"
+          echo "[${DISTRO}] Download: ${IMAGE_URL}"
           curl -fL --retry 5 --retry-delay 3 -o "${SOURCE_IMAGE}" "${IMAGE_URL}"
 
           if [[ "${SOURCE_IMAGE}" == *.xz ]]; then
-            echo "[${DISTRO}] decompress xz"
+            echo "[${DISTRO}] Decompress xz"
             unxz -f "${SOURCE_IMAGE}"
             SOURCE_IMAGE="${SOURCE_IMAGE%.xz}"
           fi
@@ -220,25 +232,27 @@ jobs:
           NM_CFG="${WORKDIR}/99-pve-no-auto-default.conf"
 
           cat > "${CLOUD_CFG}" <<'EOF'
-          datasource_list: [ "NoCloud", "None" ]
-          disable_fallback_netcfg: true
-          EOF
+datasource_list: [ "NoCloud", "ConfigDrive", "None" ]
+disable_fallback_netcfg: true
+network:
+  disable_fallback_netcfg: true
+EOF
 
           cat > "${SYSCTL_CFG}" <<'EOF'
-          net.ipv6.conf.all.accept_ra = 0
-          net.ipv6.conf.default.accept_ra = 0
-          net.ipv6.conf.all.autoconf = 0
-          net.ipv6.conf.default.autoconf = 0
-          net.ipv6.conf.all.accept_redirects = 0
-          net.ipv6.conf.default.accept_redirects = 0
-          net.ipv4.conf.all.accept_redirects = 0
-          net.ipv4.conf.default.accept_redirects = 0
-          EOF
+net.ipv6.conf.all.accept_ra = 0
+net.ipv6.conf.default.accept_ra = 0
+net.ipv6.conf.all.autoconf = 0
+net.ipv6.conf.default.autoconf = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+EOF
 
           cat > "${NM_CFG}" <<'EOF'
-          [main]
-          no-auto-default=*
-          EOF
+[main]
+no-auto-default=*
+EOF
 
           COMMON_ARGS=(
             --network
@@ -247,7 +261,6 @@ jobs:
             --mkdir /etc/sysctl.d
             --upload "${CLOUD_CFG}:/etc/cloud/cloud.cfg.d/99-pve-cloudinit-no-fallback-network.cfg"
             --upload "${SYSCTL_CFG}:/etc/sysctl.d/99-pve-disable-router-ipv6.conf"
-            --install "${PKGS}"
             --run-command 'cloud-init clean --logs || true'
             --run-command 'rm -rf /var/lib/cloud/* || true'
             --run-command 'rm -f /etc/ssh/ssh_host_* || true'
@@ -257,6 +270,8 @@ jobs:
 
           if [[ "${FAMILY}" == "debian" ]]; then
             EXTRA_ARGS=(
+              --run-command 'apt-get update || true'
+              --run-command 'DEBIAN_FRONTEND=noninteractive apt-get install -y cloud-init qemu-guest-agent || true'
               --run-command 'rm -f /etc/netplan/*.yaml || true'
               --run-command 'rm -f /etc/network/interfaces.d/* || true'
               --run-command 'mkdir -p /etc/network/interfaces.d || true'
@@ -268,6 +283,7 @@ jobs:
             EXTRA_ARGS=(
               --mkdir /etc/NetworkManager/conf.d
               --upload "${NM_CFG}:/etc/NetworkManager/conf.d/99-pve-no-auto-default.conf"
+              --run-command 'dnf -y install cloud-init qemu-guest-agent || yum -y install cloud-init qemu-guest-agent || true'
               --run-command 'rm -f /etc/NetworkManager/system-connections/*.nmconnection || true'
               --run-command 'rm -f /etc/sysconfig/network-scripts/ifcfg-eth* || true'
               --run-command 'rm -f /etc/sysconfig/network-scripts/ifcfg-ens* || true'
@@ -278,6 +294,8 @@ jobs:
             )
           elif [[ "${FAMILY}" == "alpine" ]]; then
             EXTRA_ARGS=(
+              --run-command 'apk update || true'
+              --run-command 'apk add cloud-init qemu-guest-agent openssh || true'
               --run-command 'rm -f /etc/network/interfaces.d/* || true'
               --run-command 'mkdir -p /etc/network/interfaces.d || true'
               --run-command 'printf "%s\n" "auto lo" "iface lo inet loopback" "source /etc/network/interfaces.d/*" > /etc/network/interfaces || true'
@@ -292,18 +310,18 @@ jobs:
             die "unknown family: ${FAMILY}"
           fi
 
-          echo "[${DISTRO}] customize image"
-          virt-customize "${COMMON_ARGS[@]}" "${EXTRA_ARGS[@]}"
+          echo "[${DISTRO}] Customize image"
+          sudo -E virt-customize "${COMMON_ARGS[@]}" "${EXTRA_ARGS[@]}"
 
           FINAL_IMAGE="${OUTDIR}/${OUTPUT_BASENAME}.qcow2"
 
-          echo "[${DISTRO}] convert compressed qcow2"
+          echo "[${DISTRO}] Convert compressed qcow2"
           qemu-img convert -p -O qcow2 -c "${SOURCE_IMAGE}" "${FINAL_IMAGE}"
 
           qemu-img info "${FINAL_IMAGE}" > "${FINAL_IMAGE}.info.txt"
           sha256sum "${FINAL_IMAGE}" > "${FINAL_IMAGE}.sha256"
 
-          echo "[${DISTRO}] done"
+          echo "[${DISTRO}] Done"
           ls -lh "${FINAL_IMAGE}" "${FINAL_IMAGE}.sha256" "${FINAL_IMAGE}.info.txt"
 
       - name: Upload build artifact
@@ -331,7 +349,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          find release -type f -maxdepth 1 -print | sort
+          find release -maxdepth 1 -type f -print | sort
           sha256sum release/*.qcow2
 
       - name: Publish GitHub Release
@@ -350,7 +368,8 @@ jobs:
             - Built-in DHCP network profiles are removed.
             - NetworkManager automatic default connection is disabled where applicable.
             - IPv6 RA/SLAAC is disabled by sysctl.
-            - VM networking should be configured explicitly from PVE Cloud-Init, for example ipconfig0/ip6/gw/gw6.
+            - Router-assigned IPv6 is blocked.
+            - VM networking should be configured explicitly from PVE Cloud-Init.
 
             Supported distros:
             - debian
