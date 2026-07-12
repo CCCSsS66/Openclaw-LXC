@@ -666,32 +666,28 @@ set -a
 set +a
 openclaw config validate
 
-# 注意：README 不要使用 markdown 三反引号，避免 heredoc 被编辑器破坏
-cat >/root/README-OPENCLAW-LXC.md <<'README_EOF'
-# OpenClaw LXC Debian 12
-
-## 首次使用
-
-    openclaw-info
-    openclaw-api-setup
-
-
-
-## 常用命令
-
-    openclaw-info
-    openclaw-status
-    openclaw-logs
-    openclaw-restart
-    openclaw-api-setup
-
-## Gateway
-
-默认端口：18789
-
-Token 文件：
-
-    /root/.openclaw/.env
+echo "写入容器 README"
+# 关键：不用 heredoc，避免 README_EOF 再次被吞
+{
+  printf '%s\n' "# OpenClaw LXC Debian 12"
+  printf '%s\n' ""
+  printf '%s\n' "## 首次使用"
+  printf '%s\n' ""
+  printf '%s\n' "    openclaw-info"
+  printf '%s\n' "    openclaw-api-setup"
+  printf '%s\n' ""
+  printf '%s\n' "## 常用命令"
+  printf '%s\n' ""
+  printf '%s\n' "    openclaw-info"
+  printf '%s\n' "    openclaw-status"
+  printf '%s\n' "    openclaw-logs"
+  printf '%s\n' "    openclaw-restart"
+  printf '%s\n' "    openclaw-api-setup"
+  printf '%s\n' ""
+  printf '%s\n' "## Gateway"
+  printf '%s\n' ""
+  printf '%s\n' "默认端口：18789"
+} >/root/README-OPENCLAW-LXC.md
 
 chmod 600 /root/README-OPENCLAW-LXC.md
 
@@ -701,6 +697,7 @@ rm -f /root/.openclaw/.env
 rm -f /root/.openclaw/.env.bak.*
 rm -f /root/.openclaw/*.bak.*
 rm -f /root/.openclaw/*.bad.*
+find /root/.openclaw -type f -name '.env*' -delete 2>/dev/null || true
 
 rm -f /etc/machine-id
 touch /etc/machine-id
@@ -712,5 +709,10 @@ rm -f /root/.bash_history 2>/dev/null || true
 
 apt-get clean
 rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+if [ -e /root/.openclaw/.env ]; then
+  echo "错误：清理后 .env 仍然存在"
+  exit 1
+fi
 
 echo "OpenClaw LXC rootfs ready"
