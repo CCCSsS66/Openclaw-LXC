@@ -35,17 +35,14 @@ fi
 
 cleanup_mounts() {
   set +e
-
   echo "清理 rootfs 挂载点"
 
   if [ -d "$ROOTFS/dev" ]; then
     sudo umount -Rlf "$ROOTFS/dev" 2>/dev/null || true
   fi
-
   if [ -d "$ROOTFS/proc" ]; then
     sudo umount -Rlf "$ROOTFS/proc" 2>/dev/null || true
   fi
-
   if [ -d "$ROOTFS/sys" ]; then
     sudo umount -Rlf "$ROOTFS/sys" 2>/dev/null || true
   fi
@@ -55,7 +52,6 @@ cleanup_mounts() {
 
 check_leftover_mounts() {
   local mounts
-
   mounts="$(
     sudo findmnt -rn -o TARGET 2>/dev/null |
       awk -v root="$ROOTFS" '
@@ -91,15 +87,12 @@ echo "[2/8] 准备 chroot 环境"
 echo "============================================================"
 
 sudo mount -t proc proc "$ROOTFS/proc"
-
 sudo mount --rbind /sys "$ROOTFS/sys"
 sudo mount --make-rslave "$ROOTFS/sys"
-
 sudo mount --rbind /dev "$ROOTFS/dev"
 sudo mount --make-rslave "$ROOTFS/dev"
 
 sudo cp -L /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
-
 echo "openclaw" | sudo tee "$ROOTFS/etc/hostname" >/dev/null
 
 sudo tee "$ROOTFS/etc/hosts" >/dev/null <<'HOSTS_EOF'
@@ -131,69 +124,40 @@ echo "============================================================"
 echo "[5/8] 构建阶段自检"
 echo "============================================================"
 
-sudo chroot "$ROOTFS" command -v openclaw
-sudo chroot "$ROOTFS" openclaw --version
+# 注意：command 是 shell 内置命令，不能直接 chroot 执行
+sudo chroot "$ROOTFS" /bin/bash -lc 'command -v openclaw'
+sudo chroot "$ROOTFS" /bin/bash -lc 'openclaw --version'
 
-sudo test -x \
-  "$ROOTFS/usr/local/sbin/openclaw-ensure-config"
+sudo test -x "$ROOTFS/usr/local/sbin/openclaw-ensure-config"
+sudo test -x "$ROOTFS/usr/local/bin/openclaw-api-setup"
+sudo test -x "$ROOTFS/usr/local/bin/openclaw-info"
+sudo test -x "$ROOTFS/usr/local/bin/openclaw-status"
+sudo test -x "$ROOTFS/usr/local/bin/openclaw-logs"
+sudo test -x "$ROOTFS/usr/local/bin/openclaw-restart"
+sudo test -x "$ROOTFS/usr/local/bin/openclaw-update"
+sudo test -x "$ROOTFS/usr/local/bin/openclaw-repair-max-permissions"
 
-sudo test -x \
-  "$ROOTFS/usr/local/bin/openclaw-api-setup"
+sudo test -f "$ROOTFS/etc/systemd/system/openclaw-gateway.service"
+sudo grep -q '^User=root$' "$ROOTFS/etc/systemd/system/openclaw-gateway.service"
+sudo grep -q '^Group=root$' "$ROOTFS/etc/systemd/system/openclaw-gateway.service"
 
-sudo test -x \
-  "$ROOTFS/usr/local/bin/openclaw-info"
+sudo test -f "$ROOTFS/etc/network/interfaces"
+sudo grep -Fq 'source /etc/network/interfaces.d/*' "$ROOTFS/etc/network/interfaces"
 
-sudo test -x \
-  "$ROOTFS/usr/local/bin/openclaw-status"
-
-sudo test -x \
-  "$ROOTFS/usr/local/bin/openclaw-logs"
-
-sudo test -x \
-  "$ROOTFS/usr/local/bin/openclaw-restart"
-
-sudo test -x \
-  "$ROOTFS/usr/local/bin/openclaw-update"
-
-sudo test -x \
-  "$ROOTFS/usr/local/bin/openclaw-repair-max-permissions"
-
-sudo test -f \
-  "$ROOTFS/etc/systemd/system/openclaw-gateway.service"
-
-sudo grep -q '^User=root$' \
-  "$ROOTFS/etc/systemd/system/openclaw-gateway.service"
-
-sudo grep -q '^Group=root$' \
-  "$ROOTFS/etc/systemd/system/openclaw-gateway.service"
-
-sudo test -f \
-  "$ROOTFS/etc/network/interfaces"
-
-sudo grep -Fq \
-  'source /etc/network/interfaces.d/*' \
-  "$ROOTFS/etc/network/interfaces"
-
-if sudo grep -R \
-  -E 'iface eth0 inet dhcp|iface eth0 inet6 dhcp' \
+if sudo grep -R -E 'iface eth0 inet dhcp|iface eth0 inet6 dhcp' \
   "$ROOTFS/etc/network" >/dev/null 2>&1
 then
   echo "错误：发现 DHCP 配置"
   exit 1
 fi
 
-if sudo chroot "$ROOTFS" \
-  sh -c 'command -v dhclient' >/dev/null 2>&1
-then
+if sudo chroot "$ROOTFS" /bin/bash -lc 'command -v dhclient' >/dev/null 2>&1; then
   echo "错误：dhclient 不应该存在"
   exit 1
 fi
 
-sudo test -f \
-  "$ROOTFS/etc/sysctl.d/99-openclaw-disable-ipv6.conf"
-
-sudo jq empty \
-  "$ROOTFS/root/.openclaw/openclaw.json"
+sudo test -f "$ROOTFS/etc/sysctl.d/99-openclaw-disable-ipv6.conf"
+sudo jq empty "$ROOTFS/root/.openclaw/openclaw.json"
 
 sudo jq -e '
   .gateway.bind == "lan"
@@ -208,12 +172,7 @@ sudo jq -e '
   and (.tools.deny? | not)
 ' "$ROOTFS/root/.openclaw/openclaw.json"
 
-if sudo find "$ROOTFS/root/.openclaw" \
-  -type f \
-  -name ".env" \
-  -print 2>/dev/null |
-  grep -q .
-then
+if sudo find "$ROOTFS/root/.openclaw" -type f -name ".env" -print 2>/dev/null | grep -q .; then
   echo "错误：模板中不能预置 Gateway Token"
   exit 1
 fi
@@ -224,11 +183,9 @@ echo "============================================================"
 
 cleanup_mounts
 trap - EXIT INT TERM
-
 check_leftover_mounts
 
 sudo rm -f "$ROOTFS/etc/resolv.conf"
-
 sudo tee "$ROOTFS/etc/resolv.conf" >/dev/null <<'DNS_EOF'
 nameserver 223.5.5.5
 nameserver 119.29.29.29
@@ -238,8 +195,7 @@ echo "============================================================"
 echo "[7/8] 打包 LXC 模板"
 echo "============================================================"
 
-rm -f "$DIST_DIR/$IMAGE_NAME"
-rm -f "$DIST_DIR/$SHA_NAME"
+rm -f "$DIST_DIR/$IMAGE_NAME" "$DIST_DIR/$SHA_NAME"
 
 sudo tar \
   --one-file-system \
@@ -251,7 +207,6 @@ sudo tar \
   gzip -9n >"$DIST_DIR/$IMAGE_NAME"
 
 sync
-
 test -s "$DIST_DIR/$IMAGE_NAME"
 
 file "$DIST_DIR/$IMAGE_NAME"
@@ -259,7 +214,6 @@ gzip -t "$DIST_DIR/$IMAGE_NAME"
 tar -tzf "$DIST_DIR/$IMAGE_NAME" >/dev/null
 
 TEST_DIR="$WORK_DIR/test-extract"
-
 sudo rm -rf "$TEST_DIR"
 sudo mkdir -p "$TEST_DIR"
 
@@ -271,21 +225,11 @@ sudo tar \
   --xattrs \
   --warning=no-unknown-keyword
 
-sudo test -x \
-  "$TEST_DIR/usr/local/bin/openclaw-api-setup"
-
-sudo test -x \
-  "$TEST_DIR/usr/local/bin/openclaw-info"
-
-sudo test -f \
-  "$TEST_DIR/root/.openclaw/openclaw.json"
-
-sudo jq empty \
-  "$TEST_DIR/root/.openclaw/openclaw.json"
-
-sudo test ! -e \
-  "$TEST_DIR/root/.openclaw/.env"
-
+sudo test -x "$TEST_DIR/usr/local/bin/openclaw-api-setup"
+sudo test -x "$TEST_DIR/usr/local/bin/openclaw-info"
+sudo test -f "$TEST_DIR/root/.openclaw/openclaw.json"
+sudo jq empty "$TEST_DIR/root/.openclaw/openclaw.json"
+sudo test ! -e "$TEST_DIR/root/.openclaw/.env"
 sudo rm -rf "$TEST_DIR"
 
 (
@@ -306,33 +250,25 @@ cat >"$DIST_DIR/README.md" <<README_EOF
 
 IP 必须由 Proxmox VE 配置：
 
-\`\`\`bash
-pct create CTID \\
-  local:vztmpl/$IMAGE_NAME \\
-  --hostname openclaw \\
-  --cores 4 \\
-  --memory 8192 \\
-  --rootfs local-lvm:32 \\
-  --net0 name=eth0,bridge=vmbr0,ip=IP/CIDR,gw=GATEWAY \\
-  --unprivileged 0 \\
-  --features nesting=1
-\`\`\`
+    pct create CTID \\
+      local:vztmpl/$IMAGE_NAME \\
+      --hostname openclaw \\
+      --cores 4 \\
+      --memory 8192 \\
+      --rootfs local-lvm:32 \\
+      --net0 name=eth0,bridge=vmbr0,ip=IP/CIDR,gw=GATEWAY \\
+      --unprivileged 0 \\
+      --features nesting=1
 
 模板内部不使用 DHCP。
 
 ## Gateway
 
-默认端口：
-
-\`\`\`text
-18789
-\`\`\`
+默认端口：18789
 
 访问地址：
 
-\`\`\`text
-http://CONTAINER_IP:18789
-\`\`\`
+    http://CONTAINER_IP:18789
 
 ## OpenClaw 权限
 
@@ -350,15 +286,13 @@ OpenClaw 可以在 LXC 容器内部执行任意 root 命令。
 
 ## 常用命令
 
-\`\`\`bash
-openclaw-info
-openclaw-status
-openclaw-logs
-openclaw-restart
-openclaw-update
-openclaw-repair-max-permissions
-openclaw-api-setup
-\`\`\`
+    openclaw-info
+    openclaw-status
+    openclaw-logs
+    openclaw-restart
+    openclaw-update
+    openclaw-repair-max-permissions
+    openclaw-api-setup
 
 ## 安全说明
 
@@ -366,29 +300,21 @@ Gateway 监听公网接口。
 
 Gateway Token 位于：
 
-\`\`\`text
-/root/.openclaw/.env
-\`\`\`
+    /root/.openclaw/.env
 
 获得 Gateway Token 的用户可能获得该 LXC 容器内的 root 级操作能力。
 README_EOF
 
-ls -lh \
-  "$DIST_DIR/$IMAGE_NAME" \
-  "$DIST_DIR/$SHA_NAME" \
-  "$DIST_DIR/README.md"
+ls -lh "$DIST_DIR/$IMAGE_NAME" "$DIST_DIR/$SHA_NAME" "$DIST_DIR/README.md"
 
 echo "============================================================"
 echo "[8/8] 发布 GitHub Release"
 echo "============================================================"
 
 cd "$DIST_DIR"
-
 gh auth status --hostname github.com
 
-if gh release view "$RELEASE_TAG" \
-  --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1
-then
+if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
   gh release upload "$RELEASE_TAG" \
     "$IMAGE_NAME" \
     "$SHA_NAME" \
@@ -422,7 +348,6 @@ gh release download "$RELEASE_TAG" \
 
 (
   cd "$VERIFY_DIR"
-
   sha256sum -c "$SHA_NAME"
   gzip -t "$IMAGE_NAME"
   tar -tzf "$IMAGE_NAME" >/dev/null
