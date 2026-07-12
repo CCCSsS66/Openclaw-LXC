@@ -37,7 +37,6 @@ jobs:
           set -euxo pipefail
 
           sudo apt-get update
-
           sudo apt-get install -y \
             debootstrap \
             ca-certificates \
@@ -64,6 +63,9 @@ jobs:
 
           test -f scripts/build-openclaw-lxc.sh
           test -f scripts/install-openclaw.sh
+
+          # 防止 Windows CRLF 破坏 heredoc 结束标记
+          sed -i 's/\r$//' scripts/build-openclaw-lxc.sh scripts/install-openclaw.sh
 
           bash -n scripts/build-openclaw-lxc.sh
           bash -n scripts/install-openclaw.sh
