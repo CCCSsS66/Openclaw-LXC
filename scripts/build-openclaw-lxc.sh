@@ -33,6 +33,9 @@ if [ ! -f "$INSTALL_SCRIPT" ]; then
   exit 1
 fi
 
+# 防止 CRLF
+sed -i 's/\r$//' "$INSTALL_SCRIPT" || true
+
 cleanup_mounts() {
   set +e
   echo "清理 rootfs 挂载点"
@@ -108,8 +111,10 @@ echo "============================================================"
 echo "[3/8] 复制容器安装脚本"
 echo "============================================================"
 
+sudo mkdir -p "$ROOTFS/tmp"
 sudo cp "$INSTALL_SCRIPT" "$ROOTFS/tmp/install-openclaw.sh"
 sudo chmod +x "$ROOTFS/tmp/install-openclaw.sh"
+sudo sed -i 's/\r$//' "$ROOTFS/tmp/install-openclaw.sh"
 
 echo "============================================================"
 echo "[4/8] 安装 Debian 和 OpenClaw"
@@ -121,10 +126,18 @@ sudo env \
   /bin/bash /tmp/install-openclaw.sh
 
 echo "============================================================"
+echo "[4.5/8] 强制清理模板 Token"
+echo "============================================================"
+
+# 无论 install 脚本是否漏删，构建阶段都强制清理
+sudo rm -f "$ROOTFS/root/.openclaw/.env"
+sudo rm -f "$ROOTFS/root/.openclaw/.env."*
+sudo find "$ROOTFS/root/.openclaw" -type f -name '.env*' -delete 2>/dev/null || true
+
+echo "============================================================"
 echo "[5/8] 构建阶段自检"
 echo "============================================================"
 
-# 注意：command 是 shell 内置命令，不能直接 chroot 执行
 sudo chroot "$ROOTFS" /bin/bash -lc 'command -v openclaw'
 sudo chroot "$ROOTFS" /bin/bash -lc 'openclaw --version'
 
@@ -172,8 +185,9 @@ sudo jq -e '
   and (.tools.deny? | not)
 ' "$ROOTFS/root/.openclaw/openclaw.json"
 
-if sudo find "$ROOTFS/root/.openclaw" -type f -name ".env" -print 2>/dev/null | grep -q .; then
+if sudo find "$ROOTFS/root/.openclaw" -type f -name '.env*' -print 2>/dev/null | grep -q .; then
   echo "错误：模板中不能预置 Gateway Token"
+  sudo find "$ROOTFS/root/.openclaw" -type f -name '.env*' -print
   exit 1
 fi
 
@@ -238,72 +252,73 @@ sudo rm -rf "$TEST_DIR"
   sha256sum -c "$SHA_NAME"
 )
 
-cat >"$DIST_DIR/README.md" <<README_EOF
-# OpenClaw LXC Debian 12
-
-## 模板文件
-
-- $IMAGE_NAME
-- $SHA_NAME
-
-## 创建容器
-
-IP 必须由 Proxmox VE 配置：
-
-    pct create CTID \\
-      local:vztmpl/$IMAGE_NAME \\
-      --hostname openclaw \\
-      --cores 4 \\
-      --memory 8192 \\
-      --rootfs local-lvm:32 \\
-      --net0 name=eth0,bridge=vmbr0,ip=IP/CIDR,gw=GATEWAY \\
-      --unprivileged 0 \\
-      --features nesting=1
-
-模板内部不使用 DHCP。
-
-## Gateway
-
-默认端口：18789
-
-访问地址：
-
-    http://CONTAINER_IP:18789
-
-## OpenClaw 权限
-
-- Gateway 使用 root 运行
-- tools.profile=full
-- tools.exec.host=gateway
-- tools.exec.security=full
-- tools.exec.ask=off
-- tools.elevated.enabled=true
-- agents.defaults.sandbox.mode=off
-- 不设置 tools.allow
-- 不设置 tools.deny
-
-OpenClaw 可以在 LXC 容器内部执行任意 root 命令。
-
-## 常用命令
-
-    openclaw-info
-    openclaw-status
-    openclaw-logs
-    openclaw-restart
-    openclaw-update
-    openclaw-repair-max-permissions
-    openclaw-api-setup
-
-## 安全说明
-
-Gateway 监听公网接口。
-
-Gateway Token 位于：
-
-    /root/.openclaw/.env
-
-获得 Gateway Token 的用户可能获得该 LXC 容器内的 root 级操作能力。
-README_EOF
+# 用 printf 写 README，避免 heredoc 再次踩坑
+{
+  printf '%s\n' "# OpenClaw LXC Debian 12"
+  printf '%s\n' ""
+  printf '%s\n' "## 模板文件"
+  printf '%s\n' ""
+  printf '%s\n' "- $IMAGE_NAME"
+  printf '%s\n' "- $SHA_NAME"
+  printf '%s\n' ""
+  printf '%s\n' "## 创建容器"
+  printf '%s\n' ""
+  printf '%s\n' "IP 必须由 Proxmox VE 配置："
+  printf '%s\n' ""
+  printf '%s\n' "    pct create CTID \\"
+  printf '%s\n' "      local:vztmpl/$IMAGE_NAME \\"
+  printf '%s\n' "      --hostname openclaw \\"
+  printf '%s\n' "      --cores 4 \\"
+  printf '%s\n' "      --memory 8192 \\"
+  printf '%s\n' "      --rootfs local-lvm:32 \\"
+  printf '%s\n' "      --net0 name=eth0,bridge=vmbr0,ip=IP/CIDR,gw=GATEWAY \\"
+  printf '%s\n' "      --unprivileged 0 \\"
+  printf '%s\n' "      --features nesting=1"
+  printf '%s\n' ""
+  printf '%s\n' "模板内部不使用 DHCP。"
+  printf '%s\n' ""
+  printf '%s\n' "## Gateway"
+  printf '%s\n' ""
+  printf '%s\n' "默认端口：18789"
+  printf '%s\n' ""
+  printf '%s\n' "访问地址："
+  printf '%s\n' ""
+  printf '%s\n' "    http://CONTAINER_IP:18789"
+  printf '%s\n' ""
+  printf '%s\n' "## OpenClaw 权限"
+  printf '%s\n' ""
+  printf '%s\n' "- Gateway 使用 root 运行"
+  printf '%s\n' "- tools.profile=full"
+  printf '%s\n' "- tools.exec.host=gateway"
+  printf '%s\n' "- tools.exec.security=full"
+  printf '%s\n' "- tools.exec.ask=off"
+  printf '%s\n' "- tools.elevated.enabled=true"
+  printf '%s\n' "- agents.defaults.sandbox.mode=off"
+  printf '%s\n' "- 不设置 tools.allow"
+  printf '%s\n' "- 不设置 tools.deny"
+  printf '%s\n' ""
+  printf '%s\n' "OpenClaw 可以在 LXC 容器内部执行任意 root 命令。"
+  printf '%s\n' ""
+  printf '%s\n' "## 常用命令"
+  printf '%s\n' ""
+  printf '%s\n' "    openclaw-info"
+  printf '%s\n' "    openclaw-status"
+  printf '%s\n' "    openclaw-logs"
+  printf '%s\n' "    openclaw-restart"
+  printf '%s\n' "    openclaw-update"
+  printf '%s\n' "    openclaw-repair-max-permissions"
+  printf '%s\n' "    openclaw-api-setup"
+  printf '%s\n' ""
+  printf '%s\n' "## 安全说明"
+  printf '%s\n' ""
+  printf '%s\n' "Gateway 监听公网接口。"
+  printf '%s\n' ""
+  printf '%s\n' "Gateway Token 位于："
+  printf '%s\n' ""
+  printf '%s\n' "    /root/.openclaw/.env"
+  printf '%s\n' ""
+  printf '%s\n' "获得 Gateway Token 的用户可能获得该 LXC 容器内的 root 级操作能力。"
+} >"$DIST_DIR/README.md"
 
 ls -lh "$DIST_DIR/$IMAGE_NAME" "$DIST_DIR/$SHA_NAME" "$DIST_DIR/README.md"
 
