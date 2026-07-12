@@ -57,7 +57,7 @@ jobs:
 
           gh --version
 
-      - name: Check scripts
+      - name: Validate scripts
         shell: bash
         run: |
           set -euxo pipefail
@@ -68,17 +68,10 @@ jobs:
           bash -n scripts/build-openclaw-lxc.sh
           bash -n scripts/install-openclaw.sh
 
-          chmod +x \
-            scripts/build-openclaw-lxc.sh \
-            scripts/install-openclaw.sh
+          chmod +x scripts/build-openclaw-lxc.sh scripts/install-openclaw.sh
 
       - name: Build and publish template
         shell: bash
         run: |
           set -euo pipefail
-
-          chmod +x \
-            scripts/build-openclaw-lxc.sh \
-            scripts/install-openclaw.sh
-
           ./scripts/build-openclaw-lxc.sh
