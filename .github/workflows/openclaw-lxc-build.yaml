@@ -874,16 +874,6 @@ jobs:
               echo
               echo "工作目录："
               echo "  /root/.openclaw/workspace"
-
-              echo
-              echo "权限配置："
-              echo "  root"
-              echo "  tools.profile=full"
-              echo "  tools.elevated.enabled=true"
-              echo "  tools.exec.security=full"
-              echo "  tools.exec.ask=off"
-              echo "  tools.exec.host=gateway"
-              echo "  agents.defaults.sandbox.mode=off"
               echo "============================================================"
             } >"$INFO_FILE"
 
