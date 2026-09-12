@@ -1,4 +1,4 @@
-name: Build OpenClaw LXC Ubuntu 24.04 LTS
+name: Build OpenClaw LXC Ubuntu 24.04 LTS Grok
 
 # Compatible with OpenClaw 2026.9.4+
 # - Node.js 24.16+ or 26.1+ (Linux template uses NodeSource 24.x LTS)
