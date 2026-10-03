@@ -1,0 +1,2533 @@
+name: Build OpenClaw LXC Ubuntu 24.04 LTS Template
+
+##############################################################################
+# OpenClaw LXC Ubuntu 24.04 LTS 模板构建工作流（完全重写版）
+#
+# 契约基线：/root/openclaw/docs（官方文档快照，最新 release 2026.9.7）
+#
+# ---------------------------------------------------------------------------
+# 本工作流做什么
+# ---------------------------------------------------------------------------
+#   [1/9] 生成容器内维护脚本 openclaw-lxc-manager（单文件 bash）
+#   [2/9] 生成 chroot 安装脚本 install-inside-ubuntu2404.sh
+#   [3/9] debootstrap 构建 Ubuntu 24.04 LTS（noble, amd64, minbase）
+#   [4/9] 挂载 proc/sys/dev，准备 chroot
+#   [5/9] chroot 内安装系统包、Node.js 24 LTS、OpenClaw
+#   [6/9] 写入 Gateway 配置 → 校验 → 隔离状态冒烟测试（/healthz + /startupz + /readyz）
+#   [7/9] 擦除实例态（Token/标记/日志），卸载 chroot
+#   [8/9] 打包 tar.gz + 解包复验
+#   [9/9] 上传 GitHub Release 并回下载校验 sha256
+#
+# ---------------------------------------------------------------------------
+# 相对旧版（2026.9.6 基线）修复的契约错误
+# ---------------------------------------------------------------------------
+#   * 删除 gateway.controlUi.dangerouslyDisableDeviceAuth：
+#     docs 明确其已废弃（retired, fully inert），写入只会被 doctor --fix 移除。
+#   * 删除 allowInsecureAuth：该键在任何官方文档中都不存在，属于臆造字段。
+#   * Control UI 的非 loopback 访问改为官方要求的 allowedOrigins 机制，
+#     不再伪造"免认证"；浏览器统一走设备配对流程（纯 HTTP 也可配对）。
+#   * 重启用信号修正为 SIGUSR2 语义（in-process restart）；模板不再假设
+#     SIGUSR1 可以重启（现代版本中 SIGUSR1 启动 Node inspector）。
+#   * systemd 超时值对齐官方示例：TimeoutStartSec=30、TimeoutStopSec=330
+#     （330 = Gateway 最大 315 秒 drain + 15 秒退出余量）。
+#   * tools.exec 以 mode 为唯一事实来源（legacy security/ask 是派生字段），
+#     不再探测已过时的 security/ask 组合。
+#   * npm 11.16+/12 使用 --allow-scripts=openclaw；npm 11.15 及更早版本
+#     按官方安装文档省略该参数，不在安装失败后静默扩大 lifecycle 脚本权限。
+#   * 补齐真实的 debootstrap、chroot 安装、服务配置、归档复验和 Release 发布；
+#     只生成管理脚本不再被误认为已完成模板构建。
+#
+# ---------------------------------------------------------------------------
+# 运行时契约（写死这部分，改动前先读 docs）
+# ---------------------------------------------------------------------------
+# 1) Node.js
+#      engines: >=24.16.0 <25 || >=26.1.0（官方推荐 Node 26）
+#      模板使用 NodeSource 24.x LTS；安装后硬校验 24.16+，并由 OpenClaw
+#      启动守卫检查实际加载的 WAL-safe SQLite 与 node:sqlite 能力。
+# 2) 安装
+#      npm 11.16+/12: npm install -g openclaw@<ver> --allow-scripts=openclaw
+#      npm 11.15及更早: npm install -g openclaw@<ver>
+# 3) Gateway 前台命令
+#      `openclaw gateway --port 18789`（文档 systemd 示例同款）
+# 4) 外部监管：区分运行期所有权、Doctor 服务修复策略与 restart 行为
+#      OPENCLAW_NO_RESPAWN=1             常规 Gateway restart 留在当前进程内
+#      OPENCLAW_SERVICE_REPAIR_POLICY=external   Doctor 不自动改写/操作服务
+#      OPENCLAW_SUPERVISOR_MODE=external        服务安装/停止与自更新交给外部管理器
+# 5) systemd 单元对齐官方 Linux 示例与 Gateway stop-deadline 契约
+#      Type=simple / Restart=always / RestartSec=5
+#      RestartPreventExitStatus=78（78 = 无效配置，阻止坏配置重启风暴）
+#      TimeoutStopSec=330 / KillMode=mixed / SuccessExitStatus=0 143
+# 6) 模板权限（高风险；这是模板运维者主动选择的宽权限配置，不是官方安全默认值）
+#      tools.profile=full            工具目录（不等于 Full Access）
+#      tools.exec.mode=full          允许无普通策略提示的 host exec；host=gateway
+#      agents.defaults.sandbox.mode=off  不启用工具沙箱；Gateway 以 root 运行时等于容器 root
+#      Gateway host approvals 也须允许 full/off/fallback=full；OpenClaw config 单独不够
+#      strictInlineEval 默认 false；开启时部分 inline eval 仍需要审批
+#      tools.elevated.enabled=true   开启 elevated 功能（仍受独立权限/approvals 策略约束）
+#      请仅向受信任的操作者开放；LXC 隔离不是恶意 Agent 的完整安全边界。
+# 7) Control UI
+#      gateway.controlUi.enabled=true
+#      gateway.controlUi.allowedOrigins=[当前 IP/hostname/loopback]
+#      非 loopback 部署缺少有效来源白名单会被安全审计标 critical。
+# 8) 密钥
+#      Token 明文只存 /root/.openclaw/.env（600）；
+#      openclaw.json 永远保存 "${OPENCLAW_GATEWAY_TOKEN}" 引用。
+# 9) 更新
+#      外部监管下官方 `openclaw update` 会被拒绝；模板自带 openclaw-update：
+#      备份状态 → 停服 → npm 换包 → doctor --fix → 启服 → 健康检查 → 失败回滚。
+#
+# ---------------------------------------------------------------------------
+# 产物
+# ---------------------------------------------------------------------------
+#   dist/openclaw-lxc-ubuntu2404-<version>.tar.gz
+#   dist/openclaw-lxc-ubuntu2404-<version>.tar.gz.sha256
+#   README.md（随 Release 一起发布）
+#   适用：Proxmox VE LXC 模板（tar.gz 直接导入 CT 模板）
+##############################################################################
+
+'on':
+  # 手动触发：GitHub Actions 页面 "Run workflow"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "模板版本号（auto = 使用 UTC 时间戳）"
+        required: true
+        default: "auto"
+      openclaw_version:
+        description: "OpenClaw 版本（latest 或具体版本号，例如 2026.9.7）"
+        required: true
+        default: "latest"
+
+# Release 资产需要写权限（创建/更新 Release、上传附件）
+permissions:
+  contents: write
+
+# 同一模板版本不并发构建；已排队任务不因新触发而取消
+concurrency:
+  group: openclaw-lxc-ubuntu2404-${{ inputs.version }}-${{ inputs.openclaw_version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # 全流程上限 6 小时（debootstrap + npm 安装 + 打包）
+    timeout-minutes: 360
+
+    env:
+      INPUT_VERSION: ${{ inputs.version }}
+      INPUT_OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
+      # gh CLI 使用工作流内置令牌
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      # =======================================================================
+      # 步骤 1：宿主机（GitHub Runner）构建依赖
+      # =======================================================================
+      - name: 安装构建依赖
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+
+          # debootstrap：构建 Ubuntu rootfs 的核心工具
+          # gzip/xz/zstd/tar：打包与压缩
+          # acl/attr：保留容器文件系统的 ACL 与扩展属性
+          # jq：构建期 JSON 断言
+          # gh：发布 GitHub Release；actions/checkout 在下一步前准备本工作流仓库
+          sudo apt-get install -y \
+            debootstrap \
+            ubuntu-keyring \
+            ca-certificates \
+            curl \
+            wget \
+            gnupg \
+            gzip \
+            xz-utils \
+            zstd \
+            tar \
+            jq \
+            file \
+            openssl \
+            coreutils \
+            util-linux \
+            acl \
+            attr \
+            python3 \
+            gh
+
+          debootstrap --version
+          gh --version
+          python3 --version
+
+      # =======================================================================
+      # 步骤 2：构建并发布 OpenClaw Ubuntu 24.04 LXC 模板
+      #   本步骤是一个 `run: |` 块：YAML 会剥掉公共缩进，因此内部可以：
+      #     - 直接写 bash（不再用 Python heredoc 包 bash）
+      #     - 使用顶格的 heredoc 结束符（如 MANAGER_EOF）
+      # =======================================================================
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: 构建并发布 OpenClaw Ubuntu 24.04 LXC 模板
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # 非交互式 apt（debootstrap 与 chroot 内环境）
+          export DEBIAN_FRONTEND=noninteractive
+
+          # ---------------------------------------------------------------------
+          # 输入与全局路径
+          # ---------------------------------------------------------------------
+          VERSION="${INPUT_VERSION:-auto}"
+          OPENCLAW_VERSION="${INPUT_OPENCLAW_VERSION:-latest}"
+
+          # version=auto 时使用秒级 UTC 时间戳，降低同分钟触发的冲突
+          if [ "$VERSION" = "auto" ]; then
+            VERSION="$(date -u +'%Y.%m.%d-%H%M%S')"
+          fi
+
+          # 版本号只允许字母/数字/点/下划线/横线（防止注入 tag 与路径）
+          if ! printf '%s\n' "$VERSION" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "错误：version 只能包含字母、数字、点、下划线和横线"
+            exit 1
+          fi
+
+          if [ -z "$OPENCLAW_VERSION" ]; then
+            echo "错误：OpenClaw 版本不能为空"
+            exit 1
+          fi
+
+          if [[ ! "$OPENCLAW_VERSION" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$ ]]; then
+            echo "错误：openclaw_version 只能是 latest 或明确的语义版本号"
+            exit 1
+          fi
+
+          IMAGE_PREFIX="openclaw-lxc-ubuntu2404"
+          IMAGE_NAME="${IMAGE_PREFIX}-${VERSION}.tar.gz"
+
+          WORK_DIR="$PWD/work"
+          ROOTFS="$WORK_DIR/rootfs"
+          DIST_DIR="$PWD/dist"
+          VERIFY_DIR="$WORK_DIR/archive-check"
+          DOWNLOAD_DIR="$WORK_DIR/release-download"
+
+          MANAGER_SCRIPT="$WORK_DIR/openclaw-lxc-manager"
+          INSTALL_SCRIPT="$WORK_DIR/install-inside-ubuntu2404.sh"
+
+          mkdir -p "$WORK_DIR" "$DIST_DIR"
+
+          for generated_path in \
+            "$MANAGER_SCRIPT" \
+            "$INSTALL_SCRIPT" \
+            "$ROOTFS" \
+            "$VERIFY_DIR" \
+            "$DOWNLOAD_DIR"; do
+            if [ -e "$generated_path" ] || [ -L "$generated_path" ]; then
+              echo "拒绝覆盖已有构建路径：$generated_path" >&2
+              exit 1
+            fi
+          done
+          for generated_path in \
+            "$DIST_DIR/$IMAGE_NAME" \
+            "$DIST_DIR/$IMAGE_NAME.sha256" \
+            "$DIST_DIR/README.md"; do
+            if [ -e "$generated_path" ] || [ -L "$generated_path" ]; then
+              echo "拒绝覆盖已有产物：$generated_path" >&2
+              exit 1
+            fi
+          done
+
+          # ---------------------------------------------------------------------
+          # chroot 挂载清理：无论成功失败都必须在退出前卸载
+          #   --rbind /sys /dev 后需要 --make-rslave，防止卸载递归卡住
+          # ---------------------------------------------------------------------
+          cleanup_mounts() {
+            # 每个卸载动作都单独容错；不要改变调用者的 errexit 状态。
+            if [ -n "${ROOTFS:-}" ] && [ -d "$ROOTFS" ]; then
+              sudo umount -R -lf "$ROOTFS/dev" 2>/dev/null || true
+              sudo umount -R -lf "$ROOTFS/proc" 2>/dev/null || true
+              sudo umount -R -lf "$ROOTFS/sys" 2>/dev/null || true
+
+              sudo umount -lf "$ROOTFS/dev/pts" 2>/dev/null || true
+              sudo umount -lf "$ROOTFS/dev" 2>/dev/null || true
+              sudo umount -lf "$ROOTFS/proc" 2>/dev/null || true
+              sudo umount -lf "$ROOTFS/sys" 2>/dev/null || true
+            fi
+          }
+
+          trap cleanup_mounts EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          # =====================================================================
+          # [1/9] 生成容器内维护脚本 openclaw-lxc-manager
+          #   单文件 bash，安装到 /usr/local/sbin/openclaw-lxc-manager。
+          #   所有容器内维护动作（首启/校验/信息/更新/修复）都在这里，
+          #   保证"构建期"和"运行期"使用同一套逻辑。
+          # =====================================================================
+          echo "=================================================="
+          echo "[1/9] 生成容器内维护脚本 openclaw-lxc-manager"
+          echo "=================================================="
+
+          cat >"$MANAGER_SCRIPT" <<'MANAGER_EOF'
+          #!/usr/bin/env bash
+          # =============================================================================
+          # OpenClaw LXC Manager —— 容器内唯一维护入口
+          #
+          # 部署位置：/usr/local/sbin/openclaw-lxc-manager
+          # 运行身份：root（Proxmox LXC 模板约定）
+          # 适用版本：OpenClaw 2026.9.x（engines: >=24.16 <25 || >=26.1）
+          #
+          # -----------------------------------------------------------------------------
+          # 文件布局
+          # -----------------------------------------------------------------------------
+          #   /root/.openclaw/openclaw.json     主配置（密钥永远使用 ${VAR} 引用）
+          #   /root/.openclaw/.env              实例密钥（Gateway Token / Provider Key）600
+          #   /root/.openclaw/.lxc-initialized  首次启动完成标记
+          #   /root/.openclaw/workspace         Agent 工作目录
+          #   /root/.openclaw-backups/          更新前的状态备份
+          #   /root/openclaw-info.txt            登录展示信息（含 Token，600）
+          #   /etc/openclaw-build-info.json     构建元数据
+          #
+          # -----------------------------------------------------------------------------
+          # 外部监管契约（改动前三思）
+          # -----------------------------------------------------------------------------
+          #   OPENCLAW_NO_RESPAWN=1
+          #     常规 Gateway restart 保持进程内处理，简化 PID 跟踪；不替代 systemd。
+          #   OPENCLAW_SERVICE_REPAIR_POLICY=external
+          #     Doctor 的服务修复交给外部管理器；这独立于 runtime ownership。
+          #   OPENCLAW_SUPERVISOR_MODE=external
+          #     生命周期由 systemd 管理；官方自更新被拒绝，更新走本脚本子命令。
+          #
+          # -----------------------------------------------------------------------------
+          # 命令一览（符号链接等价，见文件末尾命令分发）
+          # -----------------------------------------------------------------------------
+          #   build-init      构建期：写基础配置 + 校验（工作流 chroot 内调用）
+          #   smoke-test      构建期：隔离状态真实启动 Gateway，验证存活/启动/就绪探针
+          #   template-reset  打包前：擦除实例态（Token/标记/信息）
+          #   approvals-init 首次启动后：通过 Gateway RPC 设置 Gateway-host approvals
+          #   firstboot       首次启动：生成 Token、写入真实 IP 来源、doctor --fix
+          #   validate        使用 `openclaw config validate` 校验配置
+          #   refresh-info    重新生成登录展示信息
+          #   api-setup       交互式配置 OpenAI 兼容 Provider（含 API Key）
+          #   info            显示访问地址与 Token
+          #   status          显示版本/服务/端口/健康/配置摘要/最近日志
+          #   logs            跟踪 Gateway 日志（journalctl -f）
+          #   restart         重启 Gateway 并等待健康
+          #   start / stop    启动/停止 Gateway
+          #   repair          重写模板的宽权限配置并重启（带配置备份）
+          #   plugins         列出插件（openclaw plugins list）
+          #   update [版本]   备份 → 停服 → npm 换包 → doctor → 启服 → 失败回滚
+          # =============================================================================
+          set -Eeuo pipefail
+
+          # 私有文件默认权限：manager 生成的所有文件不允许组/其他读取
+          umask 077
+
+          # -----------------------------------------------------------------------------
+          # 常量
+          # -----------------------------------------------------------------------------
+          STATE_DIR="/root/.openclaw"
+          CONFIG_FILE="$STATE_DIR/openclaw.json"
+          ENV_FILE="$STATE_DIR/.env"
+          MARKER_FILE="$STATE_DIR/.lxc-initialized"
+          BACKUP_DIR="/root/.openclaw-backups"
+          INFO_FILE="/root/openclaw-info.txt"
+          BUILD_INFO_FILE="/etc/openclaw-build-info.json"
+          LOCK_FILE="/run/lock/openclaw-lxc-manager.lock"
+          GATEWAY_UNIT="openclaw-gateway.service"
+          GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
+          NET_IFACE="${OPENCLAW_NET_IFACE:-eth0}"
+
+          # 配置文件里的"引用形式"密钥（配置文件永远不落明文）
+          TOKEN_REF='${OPENCLAW_GATEWAY_TOKEN}'
+
+          # 冒烟测试进程 PID（供 trap 清理）
+          SMOKE_PID=""
+
+          # -----------------------------------------------------------------------------
+          # 运行时环境（任何 openclaw 子命令之前必须导出）
+          #   PATH 固定，保证 systemd 之外的交互式 shell 也能找到全局 npm 包
+          # -----------------------------------------------------------------------------
+          export HOME="/root"
+          export OPENCLAW_HOME="/root"
+          export OPENCLAW_STATE_DIR="$STATE_DIR"
+          export OPENCLAW_CONFIG_PATH="$CONFIG_FILE"
+          export OPENCLAW_SERVICE_REPAIR_POLICY="external"
+          export OPENCLAW_SUPERVISOR_MODE="external"
+          export OPENCLAW_NO_RESPAWN="1"
+          export OPENCLAW_HIDE_BANNER="1"
+          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+          # -----------------------------------------------------------------------------
+          # 基础工具函数
+          # -----------------------------------------------------------------------------
+
+          # 普通日志：stdout
+          log() {
+            printf '[openclaw-lxc] %s\n' "$*"
+          }
+
+          # 警告：stderr，不中断
+          warn() {
+            printf '[openclaw-lxc][警告] %s\n' "$*" >&2
+          }
+
+          # 致命错误：stderr + 退出 1
+          die() {
+            printf '[openclaw-lxc][错误] %s\n' "$*" >&2
+            exit 1
+          }
+
+          # 容器内维护必须以 root 运行（systemd 生命周期 + /root/.openclaw 属主）
+          require_root() {
+            [ "$(id -u)" -eq 0 ] || die "必须使用 root 运行本管理器"
+          }
+
+          # 全局维护锁：防止 update/firstboot/repair 并发写状态
+          # flock -w 600：最多等待 10 分钟，超时给出明确错误
+          acquire_lock() {
+            mkdir -p "$(dirname "$LOCK_FILE")"
+            exec 9>"$LOCK_FILE"
+            flock -w 600 9 || die "获取维护锁超时：另一个维护任务正在执行"
+          }
+
+          # 必要目录与权限（700：只有 root 能进入 state 目录）
+          ensure_directories() {
+            mkdir -p \
+              "$STATE_DIR" \
+              "$STATE_DIR/workspace" \
+              "$BACKUP_DIR"
+
+            chown root:root "$STATE_DIR" "$BACKUP_DIR"
+            chmod 700 "$STATE_DIR" "$BACKUP_DIR"
+          }
+
+          # -----------------------------------------------------------------------------
+          # /root/.openclaw/.env 读写
+          #   - OpenClaw 自身会加载 state 目录下的 .env（不覆盖已有环境变量）
+          #   - 不作为 systemd EnvironmentFile：dotenv 与 systemd 的转义语法不同，
+          #     且 unit 不应把密钥复制到 manager 环境或诊断输出。
+          # -----------------------------------------------------------------------------
+
+          # 读取单个键（不存在时输出空，绝不报错）
+          read_env_value() {
+            local key="$1"
+            local value
+
+            case "$key" in
+              OPENCLAW_GATEWAY_TOKEN) ;;
+              *)
+                [[ "$key" =~ ^OPENCLAW_PROVIDER_API_KEY_[A-F0-9]{64}$ ]] ||
+                  die "拒绝读取未知环境变量：$key"
+                ;;
+            esac
+
+            [ -s "$ENV_FILE" ] || return 0
+            value="$(sed -n "s/^${key}=//p" "$ENV_FILE" | tail -n 1)"
+
+            # write_env_value uses single-quoted dotenv values so #, spaces,
+            # dollar signs, and backslashes remain literal. Keep compatibility
+            # with older unquoted values already present in an existing .env.
+            if [ "${#value}" -ge 2 ] &&
+              [ "${value:0:1}" = "'" ] &&
+              [ "${value: -1}" = "'" ]; then
+              value="${value:1:${#value}-2}"
+            fi
+
+            printf '%s' "$value"
+          }
+
+          # 原子写入单个键：先重写无该键的副本，再追加新值，最后 mv
+          write_env_value() {
+            local key="$1"
+            local value="$2"
+            local tmp
+
+            case "$key" in
+              OPENCLAW_GATEWAY_TOKEN) ;;
+              *)
+                [[ "$key" =~ ^OPENCLAW_PROVIDER_API_KEY_[A-F0-9]{64}$ ]] ||
+                  die "拒绝写入未知环境变量：$key"
+                ;;
+            esac
+
+            case "$value" in
+              *$'\n'*|*$'\r'*) die "$key 不允许包含换行符" ;;
+            esac
+            if [[ "$value" == *"'"* ]]; then
+              die "$key 含有单引号，无法安全写入 dotenv 单引号值"
+            fi
+
+            mkdir -p "$(dirname "$ENV_FILE")"
+            touch "$ENV_FILE"
+            chmod 600 "$ENV_FILE"
+
+            tmp="$(mktemp "$(dirname "$ENV_FILE")/.env.XXXXXX")"
+            if grep -v "^${key}=" "$ENV_FILE" >"$tmp"; then
+              :
+            else
+              local grep_status=$?
+              if [ "$grep_status" -ne 1 ]; then
+                rm -f "$tmp"
+                die "读取现有环境文件失败：$ENV_FILE"
+              fi
+            fi
+            printf "%s='%s'\n" "$key" "$value" >>"$tmp"
+            chmod 600 "$tmp"
+            mv "$tmp" "$ENV_FILE"
+          }
+
+          # -----------------------------------------------------------------------------
+          # 网络信息
+          # -----------------------------------------------------------------------------
+
+          # 获取 eth0 的全局 IPv4；取不到时回退 `hostname -I` 的第一个地址
+          # （Proxmox 在容器面板静态下发 eth0 地址，不需要 DHCP）
+          get_ipv4() {
+            local value=""
+
+            value="$(
+              ip -4 -o addr show "$NET_IFACE" scope global 2>/dev/null |
+                awk '{print $4}' |
+                cut -d/ -f1 |
+                head -n 1 ||
+                true
+            )"
+
+            if [ -z "$value" ]; then
+              value="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+            fi
+
+            printf '%s' "$value"
+          }
+
+          # 主机名（默认 OpenClaw，与 /etc/hostname 一致）
+          get_hostname() {
+            hostname 2>/dev/null || printf 'OpenClaw'
+          }
+
+          # -----------------------------------------------------------------------------
+          # Gateway Token
+          #   配置文件保存 "${OPENCLAW_GATEWAY_TOKEN}" 引用；
+          #   实际值只存在于 /root/.openclaw/.env（600）。
+          #   官方要求：token 必须是非空、非常见占位符的强随机值（>=24 字符）。
+          #   openssl rand -hex 32 => 64 个十六进制字符，满足要求。
+          # -----------------------------------------------------------------------------
+          ensure_gateway_token() {
+            local token
+
+            token="$(read_env_value OPENCLAW_GATEWAY_TOKEN)"
+
+            if [ -z "$token" ] || [ "$token" = "$TOKEN_REF" ]; then
+              token="$(openssl rand -hex 32)"
+              write_env_value OPENCLAW_GATEWAY_TOKEN "$token"
+              log "已生成新的 Gateway Token（openssl rand -hex 32）"
+            fi
+
+            chmod 600 "$ENV_FILE" 2>/dev/null || true
+
+            # 让后续在本进程内执行的 openclaw 子命令立即拿到 Token
+            export OPENCLAW_GATEWAY_TOKEN="$token"
+          }
+
+          # -----------------------------------------------------------------------------
+          # Control UI 来源白名单
+          #   docs：非 loopback 部署必须配置 allowedOrigins（或 publicOrigin），
+          #   否则安全审计报 critical：gateway.control_ui.allowed_origins_required。
+          #   这里动态计算当前实例的合法来源：
+          #     loopback（UI 本机）、hostname、eth0 IP
+          #   输出为 JSON 数组（供 jq --argjson 使用）。
+          # -----------------------------------------------------------------------------
+          build_allowed_origins() {
+            jq -nc \
+              --arg port "$GATEWAY_PORT" \
+              --arg ip "$(get_ipv4)" \
+              --arg host_name "$(get_hostname)" \
+              '[
+                "http://127.0.0.1:" + $port,
+                "http://localhost:" + $port,
+                "http://" + $host_name + ":" + $port
+              ] +
+              (
+                if $ip == "" then
+                  []
+                else
+                  ["http://" + $ip + ":" + $port]
+                end
+              )
+              | unique'
+          }
+
+          # -----------------------------------------------------------------------------
+          # 配置读写
+          # -----------------------------------------------------------------------------
+
+          # 配置文件必须是有效 JSON，否则后续所有 jq 操作都是危险的
+          ensure_valid_json() {
+            [ -s "$CONFIG_FILE" ] || die "配置文件不存在：$CONFIG_FILE"
+            jq empty "$CONFIG_FILE" >/dev/null 2>&1 ||
+              die "配置文件不是有效 JSON：$CONFIG_FILE"
+          }
+
+          # 原子更新配置：
+          #   config_update '<jq 筛选器>' [jq 参数...]
+          #   - 写临时文件 → chown/chmod → mv，避免中途断电产生半截配置
+          #   - 失败时删除临时文件并报错，绝不破坏原配置
+          config_update() {
+            local filter="$1"
+            shift
+
+            local tmp
+
+            ensure_valid_json
+
+            tmp="$(mktemp "${STATE_DIR}/.openclaw.json.XXXXXX")"
+
+            if ! jq "$@" "$filter" "$CONFIG_FILE" >"$tmp"; then
+              rm -f "$tmp"
+              die "配置更新失败：jq 筛选器执行出错"
+            fi
+
+            chown root:root "$tmp"
+            chmod 600 "$tmp"
+            mv "$tmp" "$CONFIG_FILE"
+          }
+
+          # 重新导出标准环境（给子 shell / 显式调用使用；顶层已导出一次）
+          export_config_environment() {
+            export HOME="/root"
+            export OPENCLAW_HOME="/root"
+            export OPENCLAW_STATE_DIR="$STATE_DIR"
+            export OPENCLAW_CONFIG_PATH="$CONFIG_FILE"
+            export OPENCLAW_SERVICE_REPAIR_POLICY="external"
+            export OPENCLAW_SUPERVISOR_MODE="external"
+            export OPENCLAW_NO_RESPAWN="1"
+            export OPENCLAW_HIDE_BANNER="1"
+            export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          }
+
+          # 顶层已经导出；这里保持显式，方便阅读
+          export_config_environment
+
+          # -----------------------------------------------------------------------------
+          # 基础配置写入（模板主动选择的宽权限契约，不是安全默认值）
+          #   gateway.mode=local    非 local 会拒绝启动
+          #   gateway.bind=lan      容器 eth0 对外可达；loopback 等于只能本机
+          #   auth.mode=token       + 密钥引用（明文只在 .env）
+          #   controlUi.allowedOrigins  非 loopback 的硬性要求
+          #   tools.profile=full / exec.mode=full / host=gateway / sandbox=off
+          #   strictInlineEval=false：明确保留官方默认的 inline-eval 策略
+          # 采用 jq 深合并，幂等：重复执行不产生重复键，不覆盖用户新增字段。
+          # -----------------------------------------------------------------------------
+          apply_base_config() {
+            local origins
+
+            origins="$(build_allowed_origins)"
+
+            config_update '
+              .gateway = ((.gateway // {}) + {
+                mode: "local",
+                port: ($port | tonumber),
+                bind: "lan",
+                auth: ((.gateway.auth // {}) + {
+                  mode: "token",
+                  token: $tokenRef
+                })
+              }) |
+              .gateway.controlUi = ((.gateway.controlUi // {}) + {
+                enabled: true,
+                allowedOrigins: $origins
+              }) |
+              .tools = ((.tools // {}) + {
+                profile: "full",
+                elevated: ((.tools.elevated // {}) + { enabled: true }),
+                exec: ((.tools.exec // {}) + {
+                  mode: "full",
+                  host: "gateway",
+                  strictInlineEval: false
+                })
+              }) |
+              .agents = ((.agents // {}) + {
+                defaults: ((.agents.defaults // {}) + {
+                  sandbox: ((.agents.defaults.sandbox // {}) + { mode: "off" })
+                })
+              })
+            ' \
+              --arg port "$GATEWAY_PORT" \
+              --arg tokenRef "$TOKEN_REF" \
+              --argjson origins "$origins"
+          }
+
+          # 使用官方 CLI 做 schema 级校验（退出码非 0 即失败）
+          validate_config() {
+            ensure_valid_json
+            openclaw config validate
+          }
+
+          # -----------------------------------------------------------------------------
+          # systemd 单元策略校验（本模板的外部监管部署契约）
+          #   - Type=simple
+          #   - Restart=always + RestartSec=5
+          #   - RestartPreventExitStatus=78（78=无效配置）
+          #   - TimeoutStopSec=330 + KillMode=mixed + SuccessExitStatus=0 143
+          # 具体取值对齐官方 Linux systemd 示例和 Gateway stop-deadline 文档。
+          # -----------------------------------------------------------------------------
+          verify_gateway_service_policy() {
+            local unit_file="/etc/systemd/system/${GATEWAY_UNIT}"
+
+            [ -f "$unit_file" ] || die "缺少 systemd 单元：$unit_file"
+
+            if ! grep -q '^Type=simple$' "$unit_file"; then
+              die "$unit_file 缺少 Type=simple"
+            fi
+
+            if ! grep -q '^Restart=always$' "$unit_file"; then
+              die "$unit_file 缺少 Restart=always"
+            fi
+
+            if ! grep -q '^RestartSec=5$' "$unit_file"; then
+              die "$unit_file 缺少 RestartSec=5"
+            fi
+
+            if ! grep -q '^RestartPreventExitStatus=78$' "$unit_file"; then
+              die "$unit_file 缺少 RestartPreventExitStatus=78"
+            fi
+
+            if ! grep -q '^TimeoutStopSec=330$' "$unit_file"; then
+              die "$unit_file 缺少 Gateway 最大 drain 所需 TimeoutStopSec=330"
+            fi
+
+            if ! grep -q '^TimeoutStartSec=30$' "$unit_file"; then
+              die "$unit_file 缺少 TimeoutStartSec=30"
+            fi
+
+            if ! grep -q '^KillMode=mixed$' "$unit_file"; then
+              die "$unit_file 缺少 KillMode=mixed"
+            fi
+
+            if ! grep -Eq '^SuccessExitStatus=0[[:space:]]+143$' "$unit_file"; then
+              die "$unit_file 缺少 SuccessExitStatus=0 143"
+            fi
+
+            return 0
+          }
+
+          # -----------------------------------------------------------------------------
+          # 权限契约断言：配置文件必须精确满足模板承诺
+          #   注意：这里读的是磁盘上的原始 JSON，$tokenRef 应当以字面量
+          #   "${OPENCLAW_GATEWAY_TOKEN}" 存在，而不是明文 Token。
+          # -----------------------------------------------------------------------------
+          verify_permission_config() {
+            ensure_valid_json
+
+            jq -e '
+              .gateway.mode == "local" and
+              .gateway.auth.mode == "token" and
+              .gateway.auth.token == $tokenRef and
+              .tools.profile == "full" and
+              .tools.elevated.enabled == true and
+              .tools.exec.mode == "full" and
+              .tools.exec.host == "gateway" and
+              .tools.exec.strictInlineEval == false and
+              .agents.defaults.sandbox.mode == "off"
+            ' --arg tokenRef "$TOKEN_REF" "$CONFIG_FILE" >/dev/null ||
+              die "配置未达到模板要求的权限契约（请检查 $CONFIG_FILE）"
+          }
+
+          # -----------------------------------------------------------------------------
+          # 登录信息文件（info 命令的数据源）
+          #   含 Token，因此 600；同时清空 /etc/motd，避免重复输出。
+          # -----------------------------------------------------------------------------
+          refresh_info() {
+            local ipv4
+            local token
+            local installed_version
+
+            ensure_directories
+
+            ipv4="$(get_ipv4)"
+            token="$(read_env_value OPENCLAW_GATEWAY_TOKEN)"
+
+            installed_version="未知"
+
+            if [ -s "$BUILD_INFO_FILE" ]; then
+              installed_version="$(
+                jq -r '.openclawVersion // "未知"' \
+                  "$BUILD_INFO_FILE" 2>/dev/null ||
+                  printf '未知'
+              )"
+            fi
+
+            {
+              echo "============================================================"
+              echo " OpenClaw LXC Ubuntu 24.04 LTS"
+              echo "============================================================"
+              echo "OpenClaw 版本："
+              echo "  $installed_version"
+              echo
+              echo "访问地址："
+
+              if [ -n "$ipv4" ]; then
+                echo "  http://$ipv4:$GATEWAY_PORT"
+              else
+                echo "  未检测到 $NET_IFACE 的 IPv4（请在 Proxmox 面板配置静态地址）"
+              fi
+
+              echo
+              echo "Gateway Token："
+              echo "  ${token:-未生成}"
+              echo
+              echo "权限（模板运维者主动选择的宽权限配置）："
+              echo "  - tools.profile   = full"
+              echo "  - tools.elevated  = true"
+              echo "  - tools.exec.mode = full（host=gateway）"
+              echo "  - agent sandbox   = off"
+              echo
+              echo "说明：浏览器在登录页输入 Token；首次访问需完成设备配对。"
+              echo "      不要把 Token 放入 URL；HTTP LAN 访问不具备传输加密。"
+              echo
+              echo "常用命令："
+              echo "  openclaw-api-setup               配置模型 Provider（API Key）"
+              echo "  openclaw-info                    显示地址与 Token"
+              echo "  openclaw-status                  服务/端口/健康状态"
+              echo "  openclaw-logs                    跟踪 Gateway 日志"
+              echo "  openclaw-restart                 重启 Gateway"
+              echo "  openclaw-plugins                 插件列表"
+              echo "  openclaw-update [版本]           更新 OpenClaw"
+              echo "  openclaw-repair-max-permissions  重写最高权限配置"
+              echo
+              echo "工作目录："
+              echo "  /root/.openclaw/workspace"
+              echo "============================================================"
+            } >"$INFO_FILE"
+
+            chown root:root "$INFO_FILE"
+            chmod 600 "$INFO_FILE"
+
+            : >/etc/motd 2>/dev/null || true
+          }
+
+          # -----------------------------------------------------------------------------
+          # 构建期初始化（工作流在 chroot 内调用）
+          #   目的：把最终的 openclaw.json 冻进模板，并用官方 CLI 校验。
+          #   不写 marker：marker 属于实例态，firstboot 时才生成。
+          # -----------------------------------------------------------------------------
+          build_init() {
+            log "构建期初始化 OpenClaw 配置"
+
+            ensure_directories
+            verify_gateway_service_policy
+            ensure_valid_json
+            ensure_gateway_token
+            apply_base_config
+            validate_config ||
+              die "构建期配置校验失败（openclaw config validate）"
+            verify_permission_config
+            refresh_info
+
+            log "构建期初始化完成"
+          }
+
+          # -----------------------------------------------------------------------------
+          # 首次启动初始化（openclaw-firstboot.service 调用）
+          #   - 生成实例 Token
+          #   - 用真实 eth0 IP 重写 allowedOrigins
+          #   - doctor --fix 修复状态库/插件注册表（external 策略下不动 systemd）
+          #   - 写 marker，避免每次开机重复 doctor
+          # -----------------------------------------------------------------------------
+          firstboot() {
+            log "首次启动初始化"
+
+            ensure_directories
+            verify_gateway_service_policy
+            ensure_valid_json
+            ensure_gateway_token
+            apply_base_config
+            validate_config ||
+              die "首次启动配置校验失败（openclaw config validate）"
+            verify_permission_config
+
+            openclaw doctor --non-interactive --fix \
+              >/tmp/openclaw-firstboot-doctor.log 2>&1 ||
+              warn "doctor --fix 未完全成功，日志：/tmp/openclaw-firstboot-doctor.log"
+
+            touch "$MARKER_FILE"
+            chown root:root "$MARKER_FILE"
+            chmod 600 "$MARKER_FILE"
+
+            refresh_info
+
+            log "首次启动初始化完成"
+          }
+
+          # ----------------------------------------------------------------------------
+          # 首次 Gateway-host approvals 配置（由独立 oneshot 在 Gateway 启动后调用）
+          #   --gateway 必须通过 Gateway RPC 写 host approvals；不带该选项只改 CLI
+          #   本机 shared-state row，不能满足 Gateway-host 策略。专用标记可避免每
+          #   次开机覆盖运维者之后的更改。RPC 尚未 ready 时有限重试。
+          # ----------------------------------------------------------------------------
+          initialize_gateway_approvals() {
+            local attempts=0
+            local approvals_marker="$STATE_DIR/.gateway-approvals-initialized"
+
+            if [ -e "$approvals_marker" ]; then
+              log "Gateway-host approvals 已初始化；保留现有运维策略"
+              return 0
+            fi
+
+            while [ "$attempts" -lt 60 ]; do
+              if openclaw approvals set --gateway --stdin \
+                >/tmp/openclaw-approvals-init.log 2>&1 <<'APPROVALS_EOF'
+          {
+            version: 1,
+            defaults: {
+              security: "full",
+              ask: "off",
+              askFallback: "full"
+            }
+          }
+          APPROVALS_EOF
+              then
+                printf 'initialized_at=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >"$approvals_marker"
+                chown root:root "$approvals_marker"
+                chmod 600 "$approvals_marker"
+                rm -f /tmp/openclaw-approvals-init.log
+                log "Gateway-host approvals 初始化完成（full/off/fallback=full）"
+                return 0
+              fi
+
+              attempts=$((attempts + 1))
+              sleep 2
+            done
+
+            tail -n 40 /tmp/openclaw-approvals-init.log >&2 2>/dev/null || true
+            die "Gateway-host approvals RPC 120 秒内未成功；可重试 systemctl restart openclaw-approvals.service"
+          }
+
+          # -----------------------------------------------------------------------------
+          # 打包前擦除实例态（工作流在打包步骤前调用）
+          #   - Token 还原为 ${OPENCLAW_GATEWAY_TOKEN} 引用
+          #   - allowedOrigins 还原为 loopback 集合（firstboot 再写真实 IP）
+          #   - 删除 .env / marker / info / 备份目录
+          # -----------------------------------------------------------------------------
+          template_reset() {
+            local config_tmp
+
+            log "擦除实例态（模板打包前）"
+
+            ensure_valid_json
+
+            config_update '
+              .gateway.auth.mode = "token" |
+              .gateway.auth.token = $tokenRef |
+              if ((.gateway.controlUi? | type) == "object") then
+                .gateway.controlUi.allowedOrigins = $origins
+              else
+                .
+              end
+            ' \
+              --arg tokenRef "$TOKEN_REF" \
+              --argjson origins "$(build_loopback_origins)"
+
+            # 重建整个 state 目录，只保留模板配置和空 workspace。这样不会把
+            # 冒烟测试/CLI 校验生成的 SQLite、设备身份、会话、审批记录或日志
+            # 烘焙进所有新 CT；首次启动会在实例内重新创建这些状态。
+            config_tmp="$(mktemp /run/openclaw-template-config.XXXXXX)"
+            cp "$CONFIG_FILE" "$config_tmp"
+            chmod 600 "$config_tmp"
+            rm -rf -- "$STATE_DIR"
+            install -d -o root -g root -m 700 "$STATE_DIR" "$STATE_DIR/workspace"
+            mv "$config_tmp" "$CONFIG_FILE"
+            chown root:root "$CONFIG_FILE"
+            chmod 600 "$CONFIG_FILE"
+
+            rm -f "$INFO_FILE"
+            rm -rf "$BACKUP_DIR"
+            rm -f /tmp/openclaw-smoke.log /tmp/openclaw-smoke-body.json \
+              /tmp/openclaw-firstboot-doctor.log /tmp/openclaw-update-doctor.log \
+              /tmp/openclaw-api-setup-doctor.log /tmp/openclaw-repair-doctor.log
+
+            chown -R root:root "$STATE_DIR"
+            chmod 700 "$STATE_DIR" "$STATE_DIR/workspace"
+
+            log "实例态已擦除（Token/.env/标记/信息/备份）"
+          }
+
+          # 仅 loopback 的来源集合（构建期与打包前的保守值）
+          build_loopback_origins() {
+            jq -nc --arg port "$GATEWAY_PORT" '[
+              "http://127.0.0.1:" + $port,
+              "http://localhost:" + $port
+            ]'
+          }
+
+          # -----------------------------------------------------------------------------
+          # 存活等待：/healthz 只证明 HTTP server 存活，不代表已 ready。
+          # 参数：超时秒数（默认 120）
+          # -----------------------------------------------------------------------------
+          wait_for_health() {
+            local timeout="${1:-120}"
+            local waited=0
+
+            while [ "$waited" -lt "$timeout" ]; do
+              if curl -fsS --connect-timeout 3 --max-time 10 \
+                "http://127.0.0.1:${GATEWAY_PORT}/healthz" \
+                >/dev/null 2>&1; then
+                return 0
+              fi
+
+              sleep 2
+              waited=$((waited + 2))
+            done
+
+            return 1
+          }
+
+          # readiness 等待：只有 /readyz 200 才代表 Gateway 可接收流量。
+          wait_for_ready() {
+            local timeout="${1:-180}"
+            local waited=0
+
+            while [ "$waited" -lt "$timeout" ]; do
+              if curl -fsS --connect-timeout 3 --max-time 10 \
+                "http://127.0.0.1:${GATEWAY_PORT}/readyz" \
+                >/dev/null 2>&1; then
+                return 0
+              fi
+
+              sleep 2
+              waited=$((waited + 2))
+            done
+
+            return 1
+          }
+
+          # -----------------------------------------------------------------------------
+          # 冒烟测试进程清理
+          #   setsid 启动后，进程组 ID = $SMOKE_PID，优先整组 TERM→KILL，
+          #   再等待端口释放，避免污染后续 systemd 启动。
+          # -----------------------------------------------------------------------------
+          cleanup_smoke() {
+            local pid="${SMOKE_PID:-}"
+
+            if [ -n "$pid" ]; then
+              kill -TERM -- "-$pid" 2>/dev/null ||
+                kill -TERM "$pid" 2>/dev/null ||
+                true
+
+              for _ in $(seq 1 20); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 1
+              done
+
+              kill -KILL -- "-$pid" 2>/dev/null || true
+              kill -KILL "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+
+              SMOKE_PID=""
+
+              for _ in $(seq 1 20); do
+                ss -H -lnt "sport = :${GATEWAY_PORT}" 2>/dev/null | grep -q . || break
+                sleep 1
+              done
+            fi
+
+            if [ -n "${SMOKE_STATE_DIR:-}" ] && [ -d "$SMOKE_STATE_DIR" ]; then
+              rm -rf -- "$SMOKE_STATE_DIR"
+              SMOKE_STATE_DIR=""
+            fi
+          }
+
+          # -----------------------------------------------------------------------------
+          # 构建期冒烟测试（真实启动 Gateway）
+          #   使用独立临时 OPENCLAW_STATE_DIR，避免把构建期数据库/身份写入模板；
+          #   依次要求 /healthz 存活、/startupz 启动完成、/readyz 工作负载就绪。
+          #   每个探针超时都会令构建失败；清理 trap 负责进程与临时状态。
+          #   chroot 中 systemd 不运行，但启动命令与最终服务 ExecStart 一致。
+          # -----------------------------------------------------------------------------
+          smoke_test() {
+            local log_file="/tmp/openclaw-smoke.log"
+            local body_file="/tmp/openclaw-smoke-body.json"
+            local smoke_state
+            local waited=0
+            local http_code=""
+
+            ensure_valid_json
+
+            if ss -H -lnt "sport = :${GATEWAY_PORT}" 2>/dev/null | grep -q .; then
+              die "端口 ${GATEWAY_PORT} 已被占用，无法执行冒烟测试"
+            fi
+
+            smoke_state="$(mktemp -d /tmp/openclaw-smoke-state.XXXXXX)"
+            chmod 700 "$smoke_state"
+            SMOKE_STATE_DIR="$smoke_state"
+            trap cleanup_smoke EXIT
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            cp -a "$CONFIG_FILE" "$smoke_state/openclaw.json"
+            if [ -s "$ENV_FILE" ]; then
+              cp -a "$ENV_FILE" "$smoke_state/.env"
+            fi
+            : >"$log_file"
+
+            log "启动 Gateway 冒烟测试：openclaw gateway --port ${GATEWAY_PORT}"
+            setsid env \
+              OPENCLAW_STATE_DIR="$smoke_state" \
+              OPENCLAW_CONFIG_PATH="$smoke_state/openclaw.json" \
+              openclaw gateway --port "$GATEWAY_PORT" \
+              >"$log_file" 2>&1 &
+            SMOKE_PID="$!"
+
+            # /healthz：进程存活探针（docs：GET /healthz → {"ok":true,"status":"live"}）
+            while [ "$waited" -lt 90 ]; do
+              if ! kill -0 "$SMOKE_PID" 2>/dev/null; then
+                tail -n 60 "$log_file" >&2 || true
+                die "Gateway 在监听端口前退出"
+              fi
+
+              if curl -fsS --connect-timeout 3 --max-time 10 \
+                -o "$body_file" \
+                "http://127.0.0.1:${GATEWAY_PORT}/healthz" \
+                2>/dev/null; then
+                if jq -e '.ok == true' "$body_file" >/dev/null 2>&1; then
+                  break
+                fi
+              fi
+
+              sleep 2
+              waited=$((waited + 2))
+            done
+
+            if [ "$waited" -ge 90 ]; then
+              tail -n 60 "$log_file" >&2 || true
+              die "Gateway 90 秒内未通过 /healthz"
+            fi
+
+            log "/healthz 通过：$(cat "$body_file" 2>/dev/null || true)"
+
+            # /startupz 仅证明 sidecar 启动阶段结束，不证明 agent/channel 可用。
+            # 按官方语义，超过预算应失败而非警告后继续。
+            waited=0
+
+            while [ "$waited" -lt 120 ]; do
+              http_code="$(
+                curl -sS -o /dev/null -w '%{http_code}' \
+                  --connect-timeout 3 --max-time 10 \
+                  "http://127.0.0.1:${GATEWAY_PORT}/startupz" \
+                  2>/dev/null ||
+                  true
+              )"
+
+              if [ "$http_code" = "200" ]; then
+                break
+              fi
+
+              sleep 2
+              waited=$((waited + 2))
+            done
+
+            if [ "$http_code" != "200" ]; then
+              tail -n 60 "$log_file" >&2 || true
+              die "/startupz 未在 120 秒内返回 200（当前 HTTP ${http_code:-无响应}）"
+            fi
+            log "/startupz started（200）"
+
+            # /readyz 检查必需 Agent 数据库 admission 及渠道深度就绪状态。
+            waited=0
+            while [ "$waited" -lt 120 ]; do
+              http_code="$(curl -sS -o "$body_file" -w '%{http_code}' \
+                --connect-timeout 3 --max-time 10 \
+                "http://127.0.0.1:${GATEWAY_PORT}/readyz" 2>/dev/null || true)"
+              if [ "$http_code" = "200" ]; then
+                break
+              fi
+              sleep 2
+              waited=$((waited + 2))
+            done
+            if [ "$http_code" != "200" ]; then
+              tail -n 60 "$log_file" >&2 || true
+              cat "$body_file" >&2 2>/dev/null || true
+              die "/readyz 未在 120 秒内返回 200（当前 HTTP ${http_code:-无响应}）"
+            fi
+            log "/readyz usable（200）"
+
+            # 稳定性观察：10 秒内进程与端口必须保持
+            sleep 10
+
+            if ! kill -0 "$SMOKE_PID" 2>/dev/null; then
+              tail -n 60 "$log_file" >&2 || true
+              die "Gateway 通过健康检查后意外退出"
+            fi
+
+            if ! ss -H -lnt "sport = :${GATEWAY_PORT}" 2>/dev/null | grep -q .; then
+              tail -n 60 "$log_file" >&2 || true
+              die "Gateway 丢失 ${GATEWAY_PORT} 端口监听"
+            fi
+
+            cleanup_smoke
+            trap - EXIT INT TERM
+
+            log "Gateway 冒烟测试通过"
+          }
+
+          # =============================================================================
+          # api-setup：交互式配置 OpenAI 兼容 Provider（含 API Key）
+          #   - API Key 只写入 /root/.openclaw/.env（600），配置中保存引用
+          #   - api 固定为官方适配器 openai-completions（兼容 /v1/chat/completions）
+          #   - 适用：xAI / vLLM / SGLang / MLX / 自建兼容网关
+          # =============================================================================
+          api_setup() {
+            local provider_id
+            local api_key_env
+            local api_key_ref
+            local base_url
+            local api_key
+            local model_id
+            local current_key
+
+            echo "============================================================"
+            echo " OpenClaw 模型 Provider 配置向导（OpenAI 兼容端点）"
+            echo "============================================================"
+            echo "提示：兼容 /v1/chat/completions 的服务（vLLM/MLX/SGLang/xAI 等）"
+            echo "      统一使用官方适配器 openai-completions。"
+            echo
+
+            read -rp "Provider ID [grok]: " provider_id
+            provider_id="${provider_id:-grok}"
+
+            if [[ ! "$provider_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+              die "Provider ID 仅允许字母、数字、下划线和连字符"
+            fi
+
+            # A deterministic digest keeps env names valid and distinct even
+            # when provider IDs differ only by case or punctuation.
+            api_key_env="OPENCLAW_PROVIDER_API_KEY_$(
+              printf '%s' "$provider_id" | sha256sum | cut -c1-64 | tr '[:lower:]' '[:upper:]'
+            )"
+            printf -v api_key_ref '${%s}' "$api_key_env"
+
+            read -rp "Base URL [https://api.x.ai/v1]: " base_url
+            base_url="${base_url:-https://api.x.ai/v1}"
+
+            current_key="$(read_env_value "$api_key_env")"
+
+            if [ -n "$current_key" ]; then
+              read -rsp "API Key（留空沿用已保存的密钥）: " api_key
+              echo
+              api_key="${api_key:-$current_key}"
+            else
+              read -rsp "API Key: " api_key
+              echo
+            fi
+
+            [ -n "$api_key" ] || die "API Key 不能为空"
+
+            case "$api_key" in
+              *$'\n'*|*$'\r'*) die "API Key 不允许包含换行符" ;;
+            esac
+
+            read -rp "模型 ID [grok-4]: " model_id
+            model_id="${model_id:-grok-4}"
+
+            if [[ ! "$model_id" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
+              die "模型 ID 仅允许字母、数字、点、下划线、冒号、斜线和连字符"
+            fi
+            node -e '
+              try {
+                const url = new URL(process.argv[1]);
+                if (!["http:", "https:"].includes(url.protocol) ||
+                    !url.hostname || url.username || url.password ||
+                    url.search || url.hash) process.exit(1);
+              } catch { process.exit(1); }
+            ' "$base_url" || die "Base URL 必须是无凭据/查询/片段的有效 http(s) URL"
+
+            # 密钥落盘：仅 .env（600），配置中永远只是引用
+            write_env_value "$api_key_env" "$api_key"
+
+            config_update '
+              .models = ((.models // {}) + {}) |
+              .models.providers = ((.models.providers // {}) + {}) |
+              .models.providers[$id] = (
+                (.models.providers[$id] // {}) + {
+                  baseUrl: $baseUrl,
+                  apiKey: $apiKeyRef,
+                  api: "openai-completions"
+                }
+              ) |
+              .models.providers[$id].models = (
+                ((.models.providers[$id].models // []) |
+                  if any(.[]; .id == $model) then
+                    .
+                  else
+                    . + [{ id: $model, name: $model, input: ["text"] }]
+                  end)
+              ) |
+              .agents = ((.agents // {}) + {}) |
+              .agents.defaults = ((.agents.defaults // {}) + {}) |
+              .agents.defaults.model = { primary: ($id + "/" + $model) }
+            ' \
+              --arg id "$provider_id" \
+              --arg baseUrl "$base_url" \
+              --arg apiKeyRef "$api_key_ref" \
+              --arg model "$model_id"
+
+            validate_config || die "Provider 配置后校验失败"
+
+            # doctor --fix：external 策略下只修复状态数据，不触碰 systemd
+            openclaw doctor --non-interactive --fix \
+              >/tmp/openclaw-api-setup-doctor.log 2>&1 ||
+              warn "doctor --fix 未完全成功，日志：/tmp/openclaw-api-setup-doctor.log"
+
+            if systemctl is-active --quiet "$GATEWAY_UNIT"; then
+              restart_gateway || warn "Gateway 重启未通过健康检查，请执行 openclaw-status"
+            else
+              log "Gateway 当前未运行；配置会在下次启动时生效"
+            fi
+
+            refresh_info
+
+            log "Provider 已写入：$provider_id（默认模型：$provider_id/$model_id）"
+            log "API Key 保存在 $ENV_FILE（权限 600），配置中仅保留对应的环境变量引用"
+          }
+
+          # -----------------------------------------------------------------------------
+          # openclaw-info：显示访问地址与 Token（数据源：$INFO_FILE，缺失时重建）
+          # -----------------------------------------------------------------------------
+          show_info() {
+            if [ ! -s "$INFO_FILE" ]; then
+              refresh_info
+            fi
+
+            cat "$INFO_FILE"
+          }
+
+          # -----------------------------------------------------------------------------
+          # openclaw-status：一站式诊断
+          #   版本 → systemd 状态 → 重启计数 → 端口 → 健康探针 → 配置摘要 → 最近日志
+          # -----------------------------------------------------------------------------
+          show_status() {
+            local ipv4
+
+            ipv4="$(get_ipv4)"
+
+            echo "=================================================="
+            echo "OpenClaw 版本"
+            echo "=================================================="
+
+            if [ -s "$BUILD_INFO_FILE" ]; then
+              jq '.' "$BUILD_INFO_FILE" || true
+            fi
+
+            openclaw --version || true
+            node --version || true
+            npm --version || true
+
+            echo
+            echo "=================================================="
+            echo "Gateway systemd 状态"
+            echo "=================================================="
+            systemctl status "$GATEWAY_UNIT" --no-pager || true
+
+            echo
+            echo "=================================================="
+            echo "重启计数与单元策略"
+            echo "=================================================="
+            systemctl show "$GATEWAY_UNIT" \
+              -p NRestarts -p Result -p ExecMainCode -p ExecMainStatus \
+              -p ActiveState -p SubState -p Restart -p RestartUSec \
+              -p RestartPreventExitStatus || true
+
+            echo
+            echo "=================================================="
+            echo "端口监听"
+            echo "=================================================="
+            ss -lntp | grep ":${GATEWAY_PORT}" || true
+
+            echo
+            echo "=================================================="
+            echo "健康探针（docs：/healthz 存活、/readyz 就绪）"
+            echo "=================================================="
+            curl -fsS --connect-timeout 5 --max-time 10 \
+              "http://127.0.0.1:${GATEWAY_PORT}/healthz" || true
+            echo
+            curl -sS --connect-timeout 5 --max-time 10 \
+              "http://127.0.0.1:${GATEWAY_PORT}/readyz" || true
+            echo
+
+            if [ -n "$ipv4" ]; then
+              echo "局域网地址：http://$ipv4:$GATEWAY_PORT"
+            fi
+
+            echo
+            echo "=================================================="
+            echo "配置摘要"
+            echo "=================================================="
+            jq '{
+              gateway: {
+                mode: .gateway.mode,
+                port: .gateway.port,
+                bind: .gateway.bind,
+                authMode: .gateway.auth.mode,
+                controlUiEnabled: .gateway.controlUi.enabled,
+                allowedOrigins: .gateway.controlUi.allowedOrigins
+              },
+              permissions: {
+                profile: .tools.profile,
+                elevated: .tools.elevated,
+                exec: .tools.exec,
+                sandbox: .agents.defaults.sandbox
+              },
+              model: .agents.defaults.model,
+              providers: (.models.providers | keys)
+            }' "$CONFIG_FILE" 2>/dev/null || true
+
+            echo
+            echo "=================================================="
+            echo "最近日志"
+            echo "=================================================="
+            journalctl -u "$GATEWAY_UNIT" -n 60 --no-pager || true
+          }
+
+          # -----------------------------------------------------------------------------
+          # openclaw-restart：验证单元策略 → 重启 → 等待健康 → 刷新信息
+          # -----------------------------------------------------------------------------
+          restart_gateway() {
+            if [ ! -f "$MARKER_FILE" ]; then
+              firstboot
+            fi
+
+            verify_gateway_service_policy
+
+            systemctl daemon-reload
+            systemctl reset-failed "$GATEWAY_UNIT" 2>/dev/null || true
+            systemctl restart "$GATEWAY_UNIT"
+
+            if wait_for_health 180; then
+              log "Gateway 已重启并通过 /healthz"
+            else
+              warn "Gateway 重启后 180 秒内未通过 /healthz"
+              journalctl -u "$GATEWAY_UNIT" -n 60 --no-pager || true
+              return 1
+            fi
+
+            if ! wait_for_ready 180; then
+              warn "Gateway 已存活，但 180 秒内未通过 /readyz"
+              journalctl -u "$GATEWAY_UNIT" -n 60 --no-pager || true
+              return 1
+            fi
+
+            refresh_info
+            systemctl status "$GATEWAY_UNIT" --no-pager || true
+          }
+
+          # -----------------------------------------------------------------------------
+          # openclaw-repair-max-permissions：把配置重写回模板承诺的最高权限
+          #   1. 备份当前配置
+          #   2. 重写 gateway/tools/agents 三段
+          #   3. 官方 CLI 校验 + 契约断言
+          #   4. doctor --fix（仅数据层）+ 重启
+          # -----------------------------------------------------------------------------
+          repair_permissions() {
+            local backup_file
+
+            ensure_directories
+
+            backup_file="$(mktemp "$BACKUP_DIR/openclaw-before-repair-$(date +%Y%m%d-%H%M%S)-XXXXXX.json")"
+            cp -a "$CONFIG_FILE" "$backup_file" || die "无法备份当前配置：$backup_file"
+            chmod 600 "$backup_file" 2>/dev/null || true
+
+            ensure_gateway_token
+            apply_base_config
+            validate_config || die "修复后配置校验失败（备份：$backup_file）"
+            verify_permission_config
+            verify_gateway_service_policy
+
+            openclaw doctor --non-interactive --fix \
+              >/tmp/openclaw-repair-doctor.log 2>&1 ||
+              warn "doctor --fix 未完全成功，日志：/tmp/openclaw-repair-doctor.log"
+
+            if systemctl is-active --quiet "$GATEWAY_UNIT"; then
+              restart_gateway || warn "Gateway 重启未通过健康检查，请执行 openclaw-status"
+            fi
+
+            refresh_info
+
+            log "模板宽权限配置已重写（备份：$backup_file）"
+          }
+
+          # -----------------------------------------------------------------------------
+          # openclaw-plugins：列出插件（官方 CLI；旧版本无 --verbose 时自动回退）
+          # -----------------------------------------------------------------------------
+          show_plugins() {
+            openclaw plugins list --verbose 2>/dev/null ||
+              openclaw plugins list 2>/dev/null ||
+              warn "无法列出插件，请检查 OpenClaw 安装"
+          }
+
+          # -----------------------------------------------------------------------------
+          # 读取当前全局安装的 OpenClaw 版本（npm 包版本）
+          # -----------------------------------------------------------------------------
+          get_installed_version() {
+            local npm_root
+
+            npm_root="$(npm root -g 2>/dev/null || true)"
+            [ -n "$npm_root" ] || return 0
+
+            node -p "require('${npm_root}/openclaw/package.json').version" \
+              2>/dev/null || true
+          }
+
+          # -----------------------------------------------------------------------------
+          # Node 引擎断言：OpenClaw 要求 >=24.16 <25 或 >=26.1
+          #   （更新后调用：Node 不符时给出明确警告，而不是神秘的运行时报错）
+          # -----------------------------------------------------------------------------
+          assert_node_engine() {
+            node -e '
+              const [major, minor] = process.versions.node.split(".").map(Number);
+              const ok =
+                (major === 24 && minor >= 16) ||
+                (major === 26 && minor >= 1) ||
+                major > 26;
+
+              if (!ok) {
+                console.error(
+                  `Node ${process.version} 不满足 OpenClaw engines（>=24.16 <25 或 >=26.1）`
+                );
+                process.exit(1);
+              }
+            '
+          }
+
+          # -----------------------------------------------------------------------------
+          # 安装/更新 npm 包：遵循官方 npm 生命周期参数兼容性契约。
+          #   npm 11.16+/12 显式放行 openclaw install script；更旧 npm 省略参数。
+          #   失败即停止；不切换未审查镜像，也不在新 npm 上移除安全参数重试。
+          # -----------------------------------------------------------------------------
+          install_package() {
+            local version="$1"
+            local npm_version
+            local npm_major
+            local npm_minor
+            local -a lifecycle_args=()
+
+            if [[ ! "$version" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$ ]]; then
+              die "版本仅支持 latest 或明确的语义版本号：$version"
+            fi
+
+            if ! npm_version="$(npm --version)"; then
+              warn "无法读取 npm 版本；拒绝在生命周期策略未知时修改 OpenClaw 包"
+              return 1
+            fi
+            if [[ ! "$npm_version" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+              warn "无法识别 npm 版本 '$npm_version'；拒绝修改 OpenClaw 包"
+              return 1
+            fi
+            npm_major="${BASH_REMATCH[1]}"
+            npm_minor="${BASH_REMATCH[2]}"
+
+            if (( npm_major > 11 || (npm_major == 11 && npm_minor >= 16) )); then
+              lifecycle_args+=(--allow-scripts=openclaw)
+            fi
+
+            log "安装 openclaw@${version}（npm ${npm_version}，npm 官方 registry）"
+            npm install -g "openclaw@${version}" "${lifecycle_args[@]}"
+          }
+
+          # -----------------------------------------------------------------------------
+          # 更新回滚：停服 → 还原旧包 → 还原状态备份 → 启动
+          #   参数：$1=旧版本号  $2=状态备份 tar.gz 路径
+          # -----------------------------------------------------------------------------
+          rollback_package_and_state() {
+            local version="$1"
+            local backup_file="$2"
+
+            warn "开始回滚：停服 → 还原包与状态 → 启动"
+
+            systemctl stop "$GATEWAY_UNIT" 2>/dev/null || true
+
+            if ! install_package "$version"; then
+              warn "旧版本包回滚失败：$version；不会用不匹配的包启动已回滚状态"
+              return 1
+            fi
+
+            if [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
+              local restore_dir
+              restore_dir="$(mktemp -d /root/.openclaw-restore.XXXXXX)"
+              if ! tar -xzf "$backup_file" -C "$restore_dir"; then
+                rm -rf -- "$restore_dir"
+                warn "状态备份解包失败；保留当前状态且不启动 Gateway"
+                return 1
+              fi
+              if [ ! -d "$restore_dir/.openclaw" ] || [ -L "$restore_dir/.openclaw" ]; then
+                rm -rf -- "$restore_dir"
+                warn "状态备份不含安全的 .openclaw 目录；不启动 Gateway"
+                return 1
+              fi
+              rm -rf -- "$STATE_DIR"
+              mv "$restore_dir/.openclaw" "$STATE_DIR"
+              rm -rf -- "$restore_dir"
+            fi
+
+            systemctl start "$GATEWAY_UNIT" || {
+              warn "回滚包和状态已还原，但 Gateway 启动失败"
+              return 1
+            }
+          }
+
+          # -----------------------------------------------------------------------------
+          # openclaw-update [版本]：外部监管下的更新流程
+          #   停服 → 备份状态 → npm 换包 → Node 引擎检查 → doctor --fix
+          #   → 配置校验（失败回滚）→ 启动 → 健康检查（失败回滚）
+          #
+          #   说明：OPENCLAW_SUPERVISOR_MODE=external 时官方 `openclaw update`
+          #   会被拒绝（防止与 systemd 抢生命周期），因此更新必须走本流程。
+          # -----------------------------------------------------------------------------
+          update_openclaw() {
+            local target="${1:-latest}"
+            local old_version
+            local new_version
+            local backup_file
+
+            if [[ ! "$target" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$ ]]; then
+              die "版本仅支持 latest 或明确的语义版本号：$target"
+            fi
+
+            ensure_directories
+
+            old_version="$(get_installed_version)"
+            [ -n "$old_version" ] || die "无法读取当前 OpenClaw 版本"
+
+            log "停止 Gateway（外部监管：由 systemd 负责停止/启动）"
+            systemctl stop "$GATEWAY_UNIT" 2>/dev/null || true
+            if systemctl is-active --quiet "$GATEWAY_UNIT"; then
+              die "无法确认 Gateway 已停止；为保护运行中的状态数据库，取消更新"
+            fi
+
+            backup_file="$(mktemp "$BACKUP_DIR/openclaw-state-$(date +%Y%m%d-%H%M%S)-XXXXXX.tar.gz")"
+            log "备份状态目录到 $backup_file"
+            tar -czf "$backup_file" -C /root .openclaw || die "状态备份失败：$backup_file"
+
+            if ! install_package "$target"; then
+              warn "安装 openclaw@${target} 失败，回退旧版本 ${old_version}"
+              rollback_package_and_state "$old_version" "$backup_file" || true
+              die "更新失败：包安装阶段"
+            fi
+
+            new_version="$(get_installed_version)"
+            [ -n "$new_version" ] || {
+              warn "安装后的 openclaw 包版本无法读取，回滚到 $old_version"
+              rollback_package_and_state "$old_version" "$backup_file" || true
+              die "更新失败：无法确认安装包版本（已尝试回滚）"
+            }
+            log "包版本：$old_version → $new_version"
+
+            if ! assert_node_engine; then
+              warn "Node 版本不满足 OpenClaw engines，回滚到 $old_version"
+              rollback_package_and_state "$old_version" "$backup_file" || true
+              die "更新失败：Node.js 运行时不兼容（已尝试回滚）"
+            fi
+
+            openclaw doctor --non-interactive --fix \
+              >/tmp/openclaw-update-doctor.log 2>&1 ||
+              warn "doctor --fix 未完全成功，日志：/tmp/openclaw-update-doctor.log"
+
+            if ! validate_config; then
+              warn "新版本配置校验失败，回滚到 $old_version"
+              rollback_package_and_state "$old_version" "$backup_file" || true
+              die "更新失败：配置校验阶段（已回滚）"
+            fi
+
+            if ! systemctl start "$GATEWAY_UNIT"; then
+              warn "Gateway 启动失败，回滚到 $old_version"
+              rollback_package_and_state "$old_version" "$backup_file" || true
+              die "更新失败：服务启动阶段（已回滚）"
+            fi
+
+            if ! wait_for_health 180 || ! wait_for_ready 180; then
+              warn "新版本健康/就绪检查失败，回滚到 $old_version"
+              rollback_package_and_state "$old_version" "$backup_file" || true
+              wait_for_health 120 && wait_for_ready 120 || true
+              die "更新失败：健康检查阶段（已回滚）"
+            fi
+
+            jq -n \
+              --arg openclawVersion "$new_version" \
+              --arg requestedVersion "$target" \
+              --arg nodeVersion "$(node --version)" \
+              --arg npmVersion "$(npm --version)" \
+              --arg updateTime "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              '{
+                openclawVersion: $openclawVersion,
+                requestedOpenclawVersion: $requestedVersion,
+                nodeVersion: $nodeVersion,
+                npmVersion: $npmVersion,
+                distribution: "Ubuntu 24.04 LTS",
+                codename: "noble",
+                architecture: "amd64",
+                updateTime: $updateTime
+              }' >"$BUILD_INFO_FILE"
+
+            chmod 644 "$BUILD_INFO_FILE"
+
+            refresh_info
+
+            log "更新完成：$old_version → $new_version（备份：$backup_file）"
+            systemctl status "$GATEWAY_UNIT" --no-pager || true
+          }
+
+          # =============================================================================
+          # 命令分发
+          #   兼容两种调用方式：
+          #     openclaw-lxc-manager <命令> [参数]   （管理器本体）
+          #     openclaw-<命令>                    （/usr/local/bin 符号链接）
+          # =============================================================================
+          require_root
+
+          invoked_name="$(basename "$0")"
+          command_name="$invoked_name"
+
+          if [ "$invoked_name" = "openclaw-lxc-manager" ]; then
+            command_name="${1:-}"
+
+            if [ "$#" -gt 0 ]; then
+              shift
+            fi
+          fi
+
+          case "$command_name" in
+            firstboot)
+              # systemd openclaw-firstboot.service（ConditionPathExists 保证只跑一次）
+              acquire_lock
+              firstboot
+              ;;
+
+            approvals-init)
+              acquire_lock
+              initialize_gateway_approvals
+              ;;
+
+            build-init)
+              # 构建期：工作流在 chroot 内调用
+              acquire_lock
+              build_init
+              ;;
+
+            template-reset)
+              # 打包前：擦除实例态
+              acquire_lock
+              template_reset
+              ;;
+
+            validate)
+              validate_config
+              ;;
+
+            smoke-test)
+              # 构建期：真实启动 Gateway 验证
+              acquire_lock
+              smoke_test
+              ;;
+
+            refresh-info)
+              acquire_lock
+              refresh_info
+              ;;
+
+            openclaw-api-setup|api-setup)
+              acquire_lock
+              api_setup
+              ;;
+
+            openclaw-info|info)
+              show_info
+              ;;
+
+            openclaw-status|status)
+              show_status
+              ;;
+
+            openclaw-logs|logs)
+              exec journalctl -u "$GATEWAY_UNIT" -f
+              ;;
+
+            openclaw-restart|restart)
+              acquire_lock
+              restart_gateway
+              ;;
+
+            openclaw-start|start)
+              acquire_lock
+              systemctl start "$GATEWAY_UNIT"
+              if ! wait_for_health 120 || ! wait_for_ready 180; then
+                journalctl -u "$GATEWAY_UNIT" -n 60 --no-pager || true
+                die "Gateway 未在时限内通过 /healthz 和 /readyz"
+              fi
+              ;;
+
+            openclaw-stop|stop)
+              systemctl stop "$GATEWAY_UNIT"
+              ;;
+
+            openclaw-repair-max-permissions|repair|repair-permissions)
+              acquire_lock
+              repair_permissions
+              ;;
+
+            openclaw-plugins|plugins)
+              show_plugins
+              ;;
+
+            openclaw-update|update)
+              acquire_lock
+              update_openclaw "${1:-latest}"
+              ;;
+
+            *)
+              cat <<'USAGE'
+          OpenClaw LXC Manager（OpenClaw 2026.9.x 契约）
+
+          用法：
+            openclaw-lxc-manager <命令> [参数]
+
+          容器内维护命令（同名符号链接直接可用）：
+            openclaw-api-setup               配置模型 Provider（API Key）
+            openclaw-info                    显示访问地址与 Token
+            openclaw-status                  版本/服务/端口/健康/配置摘要
+            openclaw-logs                    跟踪 Gateway 日志
+            openclaw-restart                 重启 Gateway
+            openclaw-plugins                 插件列表
+            openclaw-update [版本]           更新 OpenClaw（默认 latest）
+            openclaw-repair-max-permissions  重写模板宽权限配置（高风险）
+
+          内部命令（构建与 systemd 使用）：
+            build-init / firstboot / approvals-init / template-reset / validate / smoke-test / refresh-info
+          USAGE
+              exit 1
+              ;;
+          esac
+          MANAGER_EOF
+
+          chmod +x "$MANAGER_SCRIPT"
+
+          echo "管理器脚本已生成：$(wc -l <"$MANAGER_SCRIPT") 行"
+
+          # =====================================================================
+          # [2/9] 生成可重复执行的 Ubuntu chroot 安装脚本
+          #   版本通过环境变量传入，避免把手动输入的版本拼进脚本文本。
+          # =====================================================================
+          echo "=================================================="
+          echo "[2/9] 生成 chroot 安装脚本"
+          echo "=================================================="
+
+          cat >"$INSTALL_SCRIPT" <<'INSTALL_EOF'
+          #!/usr/bin/env bash
+          # Ubuntu 24.04 noble amd64 chroot provisioning.
+          set -Eeuo pipefail
+          umask 022
+
+          OPENCLAW_VERSION="${OPENCLAW_VERSION:?OPENCLAW_VERSION is required}"
+          TEMPLATE_VERSION="${TEMPLATE_VERSION:?TEMPLATE_VERSION is required}"
+          OPENCLAW_PORT="18789"
+
+          if [[ ! "$OPENCLAW_VERSION" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$ ]]; then
+            echo "Invalid OpenClaw version: $OPENCLAW_VERSION" >&2
+            exit 2
+          fi
+
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Prevent package postinst scripts from starting daemons in chroot.
+          # Services are enabled offline and first start when the LXC boots.
+          cat >/usr/sbin/policy-rc.d <<'POLICY_RC_EOF'
+          #!/bin/sh
+          exit 101
+          POLICY_RC_EOF
+          chmod 0755 /usr/sbin/policy-rc.d
+
+          echo "[5/9] Install Ubuntu runtime packages"
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            gnupg \
+            jq \
+            openssl \
+            iproute2 \
+            iputils-ping \
+            procps \
+            psmisc \
+            util-linux \
+            sed \
+            gawk \
+            grep \
+            coreutils \
+            findutils \
+            tar \
+            gzip \
+            xz-utils \
+            locales \
+            tzdata \
+            systemd \
+            systemd-sysv \
+            dbus \
+            dbus-user-session
+
+          # en_US.UTF-8 avoids locale-dependent CLI and Node behavior.
+          sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+          locale-gen en_US.UTF-8
+          update-locale LANG=en_US.UTF-8
+          ln -snf /usr/share/zoneinfo/Etc/UTC /etc/localtime
+          printf '%s\n' 'Etc/UTC' >/etc/timezone
+
+          echo "[5/9] Install supported Node.js 24 LTS runtime"
+          curl --fail --silent --show-error --location \
+            https://deb.nodesource.com/setup_24.x \
+            --output /tmp/nodesource_setup.sh
+          bash /tmp/nodesource_setup.sh
+          rm -f /tmp/nodesource_setup.sh
+          apt-get install -y nodejs
+
+          node -e '
+            const [major, minor] = process.versions.node.split(".").map(Number);
+            if (major !== 24 || minor < 16) {
+              console.error(`Unsupported Node runtime: ${process.version}; expected >=24.16 <25`);
+              process.exit(1);
+            }
+          '
+
+          NODE_VERSION="$(node --version)"
+          NPM_VERSION="$(npm --version)"
+          echo "Node ${NODE_VERSION}; npm ${NPM_VERSION}"
+
+          npm_has_lifecycle_flag() {
+            node -e '
+              const [major, minor] = process.argv[1].split(".").map(Number);
+              process.exit(major > 11 || (major === 11 && minor >= 16) ? 0 : 1);
+            ' "$NPM_VERSION"
+          }
+
+          echo "[5/9] Install OpenClaw ${OPENCLAW_VERSION} from the npm registry"
+          if npm_has_lifecycle_flag; then
+            npm install --global "openclaw@${OPENCLAW_VERSION}" --allow-scripts=openclaw
+          else
+            npm install --global "openclaw@${OPENCLAW_VERSION}"
+          fi
+
+          OPENCLAW_BIN="$(command -v openclaw)"
+          OPENCLAW_BIN="$(readlink -f "$OPENCLAW_BIN")"
+          OPENCLAW_PACKAGE_JSON="$(npm root --global)/openclaw/package.json"
+          OPENCLAW_INSTALLED_VERSION="$(node -p 'require(process.argv[1]).version' "$OPENCLAW_PACKAGE_JSON")"
+          OPENCLAW_ENGINES="$(node -p 'require(process.argv[1]).engines.node' "$OPENCLAW_PACKAGE_JSON")"
+          test -x "$OPENCLAW_BIN"
+          openclaw --version
+
+          # Store no runtime credentials in the image. build-init temporarily
+          # creates a token for schema validation; template-reset removes it.
+          # This temp path is transient and restored from the packaged unit below.
+          rm -f /usr/sbin/policy-rc.d
+          install -d -o root -g root -m 0700 \
+            /root/.openclaw \
+            /root/.openclaw/workspace \
+            /root/.openclaw-backups
+          printf '{}\n' >/root/.openclaw/openclaw.json
+          chown root:root /root/.openclaw/openclaw.json
+          chmod 0600 /root/.openclaw/openclaw.json
+
+          install -d -o root -g root -m 0755 /usr/local/libexec
+          install -o root -g root -m 0755 \
+            /root/install-inside-ubuntu2404.sh \
+            /usr/local/libexec/openclaw-lxc-install-inside-ubuntu2404.sh
+          install -o root -g root -m 0755 \
+            /root/openclaw-lxc-manager \
+            /usr/local/sbin/openclaw-lxc-manager
+
+          for command_name in \
+            openclaw-api-setup \
+            openclaw-info \
+            openclaw-status \
+            openclaw-logs \
+            openclaw-restart \
+            openclaw-start \
+            openclaw-stop \
+            openclaw-repair-max-permissions \
+            openclaw-plugins \
+            openclaw-update; do
+            ln -sfn /usr/local/sbin/openclaw-lxc-manager "/usr/local/bin/${command_name}"
+          done
+
+          install -d -o root -g root -m 0755 /etc/systemd/system
+          cat >/etc/systemd/system/openclaw-firstboot.service <<'FIRSTBOOT_UNIT_EOF'
+          [Unit]
+          Description=Initialize OpenClaw LXC instance state
+          After=local-fs.target network-online.target
+          Wants=network-online.target
+          Before=openclaw-gateway.service
+          ConditionPathExists=!/root/.openclaw/.lxc-initialized
+
+          [Service]
+          Type=oneshot
+          User=root
+          Group=root
+          Environment=HOME=/root
+          Environment=OPENCLAW_HOME=/root
+          Environment=OPENCLAW_STATE_DIR=/root/.openclaw
+          Environment=OPENCLAW_CONFIG_PATH=/root/.openclaw/openclaw.json
+          Environment=OPENCLAW_SERVICE_REPAIR_POLICY=external
+          Environment=OPENCLAW_SUPERVISOR_MODE=external
+          Environment=OPENCLAW_NO_RESPAWN=1
+          Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          ExecStart=/usr/local/sbin/openclaw-lxc-manager firstboot
+          TimeoutStartSec=600
+
+          [Install]
+          WantedBy=multi-user.target
+          FIRSTBOOT_UNIT_EOF
+
+          cat >/etc/systemd/system/openclaw-approvals.service <<'APPROVALS_UNIT_EOF'
+          [Unit]
+          Description=Initialize OpenClaw Gateway-host exec approvals
+          After=network-online.target openclaw-gateway.service
+          Wants=network-online.target
+          Requires=openclaw-gateway.service
+          ConditionPathExists=!/root/.openclaw/.gateway-approvals-initialized
+
+          [Service]
+          Type=oneshot
+          User=root
+          Group=root
+          Environment=HOME=/root
+          Environment=OPENCLAW_HOME=/root
+          Environment=OPENCLAW_STATE_DIR=/root/.openclaw
+          Environment=OPENCLAW_CONFIG_PATH=/root/.openclaw/openclaw.json
+          Environment=OPENCLAW_SERVICE_REPAIR_POLICY=external
+          Environment=OPENCLAW_SUPERVISOR_MODE=external
+          Environment=OPENCLAW_NO_RESPAWN=1
+          Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          ExecStart=/usr/local/sbin/openclaw-lxc-manager approvals-init
+          TimeoutStartSec=150
+
+          [Install]
+          WantedBy=multi-user.target
+          APPROVALS_UNIT_EOF
+
+          cat >/etc/systemd/system/openclaw-gateway.service <<'GATEWAY_UNIT_EOF'
+          [Unit]
+          Description=OpenClaw Gateway (LXC)
+          After=network-online.target openclaw-firstboot.service
+          Wants=network-online.target
+          Requires=openclaw-firstboot.service
+          StartLimitBurst=10
+          StartLimitIntervalSec=300
+
+          [Service]
+          Type=simple
+          User=root
+          Group=root
+          WorkingDirectory=/root
+          Environment=HOME=/root
+          Environment=OPENCLAW_HOME=/root
+          Environment=OPENCLAW_STATE_DIR=/root/.openclaw
+          Environment=OPENCLAW_CONFIG_PATH=/root/.openclaw/openclaw.json
+          Environment=OPENCLAW_SERVICE_REPAIR_POLICY=external
+          Environment=OPENCLAW_SUPERVISOR_MODE=external
+          Environment=OPENCLAW_NO_RESPAWN=1
+          Environment=OPENCLAW_HIDE_BANNER=1
+          Environment=OPENCLAW_GATEWAY_PORT=18789
+          Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          ExecStart=/usr/bin/env openclaw gateway --port 18789
+          Restart=always
+          RestartSec=5
+          RestartPreventExitStatus=78
+          TimeoutStartSec=30
+          TimeoutStopSec=330
+          SuccessExitStatus=0 143
+          OOMPolicy=continue
+          KillMode=mixed
+
+          [Install]
+          WantedBy=multi-user.target
+          GATEWAY_UNIT_EOF
+
+          # Generic identity belongs to the eventual container, never to this
+          # build runner. systemd creates a fresh machine-id on first boot.
+          printf '%s\n' 'openclaw' >/etc/hostname
+          cat >/etc/hosts <<'HOSTS_EOF'
+          127.0.0.1 localhost
+          127.0.1.1 openclaw
+          ::1 localhost ip6-localhost ip6-loopback
+          HOSTS_EOF
+          rm -f /etc/machine-id /var/lib/dbus/machine-id
+          install -d -o root -g root -m 0755 /var/lib/dbus
+          : >/etc/machine-id
+          chmod 0444 /etc/machine-id
+          ln -s /etc/machine-id /var/lib/dbus/machine-id
+
+          jq -n \
+            --arg templateVersion "$TEMPLATE_VERSION" \
+            --arg openclawVersion "$OPENCLAW_INSTALLED_VERSION" \
+            --arg requestedOpenclawVersion "$OPENCLAW_VERSION" \
+            --arg openclawEngines "$OPENCLAW_ENGINES" \
+            --arg nodeVersion "$NODE_VERSION" \
+            --arg npmVersion "$NPM_VERSION" \
+            --arg builtAt "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            '{
+              templateVersion: $templateVersion,
+              openclawVersion: $openclawVersion,
+              requestedOpenclawVersion: $requestedOpenclawVersion,
+              openclawNodeEngines: $openclawEngines,
+              nodeVersion: $nodeVersion,
+              npmVersion: $npmVersion,
+              distribution: "Ubuntu 24.04 LTS",
+              codename: "noble",
+              architecture: "amd64",
+              builtAt: $builtAt
+            }' >/etc/openclaw-build-info.json
+          chown root:root /etc/openclaw-build-info.json
+          chmod 0644 /etc/openclaw-build-info.json
+
+          # Offline enable is performed by systemctl --root on the build host.
+          # Avoid carrying the runner resolver, apt indexes, logs, or caches.
+          rm -f /etc/resolv.conf
+          : >/etc/resolv.conf
+          chmod 0644 /etc/resolv.conf
+          rm -f /usr/sbin/policy-rc.d
+          apt-get clean
+          rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+          rm -rf /tmp/* /var/tmp/*
+          rm -f /root/.bash_history /root/.wget-hsts
+          rm -rf /root/.ssh
+
+          echo "Provisioned OpenClaw ${OPENCLAW_INSTALLED_VERSION} with Node ${NODE_VERSION}"
+          INSTALL_EOF
+
+          chmod +x "$INSTALL_SCRIPT"
+
+          # =====================================================================
+          # [3/9] debootstrap 创建 Ubuntu 24.04 LTS / noble / amd64 rootfs
+          # =====================================================================
+          echo "=================================================="
+          echo "[3/9] debootstrap Ubuntu 24.04 noble amd64"
+          echo "=================================================="
+
+          if [ -e "$ROOTFS" ]; then
+            echo "拒绝复用已存在的 rootfs：$ROOTFS" >&2
+            exit 1
+          fi
+          mkdir -p "$ROOTFS"
+          sudo debootstrap \
+            --arch=amd64 \
+            --variant=minbase \
+            --keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg \
+            noble "$ROOTFS" http://archive.ubuntu.com/ubuntu
+
+          # =====================================================================
+          # [4/9] 挂载 chroot 所需的内核接口及临时构建 DNS
+          #   Resolver 仅用于安装阶段；不会把 GitHub Runner DNS 带入模板。
+          # =====================================================================
+          echo "=================================================="
+          echo "[4/9] 准备 chroot 挂载"
+          echo "=================================================="
+
+          sudo install -d "$ROOTFS/dev/pts" "$ROOTFS/proc" "$ROOTFS/sys" "$ROOTFS/run"
+          sudo rm -f "$ROOTFS/etc/resolv.conf"
+          sudo install -m 0644 /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
+
+          sudo mount -t proc proc "$ROOTFS/proc"
+          sudo mount --rbind /sys "$ROOTFS/sys"
+          sudo mount --make-rslave "$ROOTFS/sys"
+          sudo mount --rbind /dev "$ROOTFS/dev"
+          sudo mount --make-rslave "$ROOTFS/dev"
+
+          # =====================================================================
+          # [5/9] chroot 安装系统包、Node.js、OpenClaw 与 systemd units
+          # =====================================================================
+          echo "=================================================="
+          echo "[5/9] 在 chroot 中执行安装"
+          echo "=================================================="
+
+          sudo install -o root -g root -m 0755 "$MANAGER_SCRIPT" "$ROOTFS/root/openclaw-lxc-manager"
+          sudo install -o root -g root -m 0755 "$INSTALL_SCRIPT" "$ROOTFS/root/install-inside-ubuntu2404.sh"
+
+          sudo chroot "$ROOTFS" /usr/bin/env \
+            OPENCLAW_VERSION="$OPENCLAW_VERSION" \
+            TEMPLATE_VERSION="$VERSION" \
+            /bin/bash /root/install-inside-ubuntu2404.sh
+
+          # Enable in the target root without trying to start system services
+          # inside the build chroot.
+          sudo systemctl --root="$ROOTFS" enable \
+            openclaw-firstboot.service \
+            openclaw-approvals.service \
+            openclaw-gateway.service
+
+          # Validate embedded scripts and unit syntax before any Gateway run.
+          sudo chroot "$ROOTFS" /bin/bash -n /usr/local/sbin/openclaw-lxc-manager
+          sudo chroot "$ROOTFS" /bin/bash -n /usr/local/libexec/openclaw-lxc-install-inside-ubuntu2404.sh
+          sudo chroot "$ROOTFS" systemd-analyze verify \
+            /etc/systemd/system/openclaw-firstboot.service \
+            /etc/systemd/system/openclaw-approvals.service \
+            /etc/systemd/system/openclaw-gateway.service
+
+          # =====================================================================
+          # [6/9] 按官方 CLI 校验配置，并以临时状态启动 Gateway 做三探针测试
+          # =====================================================================
+          echo "=================================================="
+          echo "[6/9] 校验配置并冒烟测试 Gateway"
+          echo "=================================================="
+
+          sudo chroot "$ROOTFS" /usr/local/sbin/openclaw-lxc-manager build-init
+          sudo chroot "$ROOTFS" /usr/local/sbin/openclaw-lxc-manager validate
+          sudo chroot "$ROOTFS" /usr/local/sbin/openclaw-lxc-manager smoke-test
+
+          # =====================================================================
+          # [7/9] 擦除模板实例态、构建痕迹并安全卸载 chroot
+          # =====================================================================
+          echo "=================================================="
+          echo "[7/9] 清理实例状态和构建痕迹"
+          echo "=================================================="
+
+          sudo chroot "$ROOTFS" /usr/local/sbin/openclaw-lxc-manager template-reset
+          sudo rm -f \
+            "$ROOTFS/root/openclaw-lxc-manager" \
+            "$ROOTFS/root/install-inside-ubuntu2404.sh" \
+            "$ROOTFS/usr/local/libexec/openclaw-lxc-install-inside-ubuntu2404.sh" \
+            "$ROOTFS/root/.bash_history" \
+            "$ROOTFS/root/.wget-hsts"
+          sudo rm -rf "$ROOTFS/tmp"/* "$ROOTFS/var/tmp"/*
+          sudo find "$ROOTFS/var/log" -type f -exec truncate -s 0 {} \;
+          sudo find "$ROOTFS" -xdev \( -name '.npm' -o -name '.cache' \) \
+            -type d -prune -exec rm -rf -- {} +
+          sudo rm -rf "$ROOTFS/var/lib/apt/lists"/* "$ROOTFS/var/cache/apt/archives"/*
+          sudo rm -f "$ROOTFS/etc/resolv.conf"
+          sudo install -o root -g root -m 0644 /dev/null "$ROOTFS/etc/resolv.conf"
+          sudo rm -f "$ROOTFS/etc/ssh/ssh_host_"* 2>/dev/null || true
+          sudo rm -f "$ROOTFS/var/lib/systemd/random-seed"
+          sudo rm -f "$ROOTFS/etc/machine-id" "$ROOTFS/var/lib/dbus/machine-id"
+          sudo install -o root -g root -m 0444 /dev/null "$ROOTFS/etc/machine-id"
+          sudo ln -s /etc/machine-id "$ROOTFS/var/lib/dbus/machine-id"
+          sudo sync
+
+          # Stop host-side mount propagation before inspecting or archiving rootfs.
+          cleanup_mounts
+          trap - EXIT INT TERM
+
+          # Never place build credentials or runner identifiers in the template.
+          if sudo test -e "$ROOTFS/root/.openclaw/.env" || \
+             sudo test -e "$ROOTFS/root/.openclaw/.lxc-initialized"; then
+            echo "错误：模板中残留实例 Token 或初始化标记" >&2
+            exit 1
+          fi
+          if sudo jq -e '
+            .gateway.auth.token == "${OPENCLAW_GATEWAY_TOKEN}" and
+            (.gateway.controlUi.allowedOrigins | all(startswith("http://127.0.0.1:") or startswith("http://localhost:")))
+          ' "$ROOTFS/root/.openclaw/openclaw.json" >/dev/null; then
+            :
+          else
+            echo "错误：模板配置未恢复为密钥引用和 loopback 来源" >&2
+            exit 1
+          fi
+
+          # =====================================================================
+          # [8/9] Proxmox rootfs tar.gz、校验和、完整解包复验
+          # =====================================================================
+          echo "=================================================="
+          echo "[8/9] 打包并复验归档"
+          echo "=================================================="
+
+          IMAGE_PATH="$DIST_DIR/$IMAGE_NAME"
+          sudo tar \
+            --numeric-owner \
+            --acls \
+            --xattrs \
+            --xattrs-include='*' \
+            --hard-dereference \
+            --sparse \
+            -czf "$IMAGE_PATH" \
+            -C "$ROOTFS" .
+
+          # Validate all entries, stream-read all regular members, and extract
+          # through dirfd + O_NOFOLLOW. Absolute links (for example /var/run)
+          # remain symlinks and are never followed by this verification pass.
+          sudo python3 - "$IMAGE_PATH" "$VERIFY_DIR" <<'ARCHIVE_CHECK_EOF'
+          import os
+          import shutil
+          import stat
+          import sys
+          import tarfile
+          from pathlib import PurePosixPath
+
+          STANDARD_DEVICES = {
+              "dev/console": (5, 1),
+              "dev/full": (1, 7),
+              "dev/kmsg": (1, 11),
+              "dev/null": (1, 3),
+              "dev/ptmx": (5, 2),
+              "dev/random": (1, 8),
+              "dev/tty": (5, 0),
+              "dev/urandom": (1, 9),
+              "dev/zero": (1, 5),
+          }
+
+          archive = sys.argv[1]
+          destination = sys.argv[2]
+          os.makedirs(destination, mode=0o755, exist_ok=True)
+          root_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+          def path_parts(name: str) -> list[str]:
+              path = PurePosixPath(name)
+              if path.is_absolute() or "\\" in name:
+                  raise SystemExit(f"unsafe archive path: {name!r}")
+              parts = [part for part in path.parts if part not in ("", ".", "/")]
+              if any(part == ".." for part in parts):
+                  raise SystemExit(f"path traversal in archive: {name!r}")
+              return parts
+
+          def open_parent(parts: list[str]) -> tuple[int, str]:
+              if not parts:
+                  raise SystemExit("archive member has no filename")
+              fd = os.dup(root_fd)
+              try:
+                  for part in parts[:-1]:
+                      try:
+                          os.mkdir(part, mode=0o755, dir_fd=fd)
+                      except FileExistsError:
+                          pass
+                      next_fd = os.open(
+                          part,
+                          os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                          dir_fd=fd,
+                      )
+                      os.close(fd)
+                      fd = next_fd
+                  return fd, parts[-1]
+              except BaseException:
+                  os.close(fd)
+                  raise
+
+          count = 0
+          seen = {}
+          with tarfile.open(archive, "r:gz") as tf:
+              for member in tf:
+                  count += 1
+                  parts = path_parts(member.name)
+                  if not parts:
+                      if member.isdir():
+                          continue
+                      raise SystemExit(f"unexpected root archive member: {member.name!r}")
+                  name = "/".join(parts)
+                  if name in seen:
+                      if member.isdir() and seen[name] == "dir":
+                          continue
+                      raise SystemExit(f"duplicate archive member: {name!r}")
+                  parent_fd, leaf = open_parent(parts)
+                  try:
+                      if member.isdir():
+                          try:
+                              os.mkdir(leaf, mode=member.mode & 0o777, dir_fd=parent_fd)
+                          except FileExistsError:
+                              info = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                              if not stat.S_ISDIR(info.st_mode):
+                                  raise SystemExit(f"directory collides with non-directory: {name!r}")
+                          child_fd = os.open(
+                              leaf,
+                              os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=parent_fd,
+                          )
+                          os.fchmod(child_fd, member.mode & 0o7777)
+                          os.close(child_fd)
+                          seen[name] = "dir"
+                      elif member.isfile():
+                          fd = os.open(
+                              leaf,
+                              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                              member.mode & 0o777,
+                              dir_fd=parent_fd,
+                          )
+                          try:
+                              stream = tf.extractfile(member)
+                              if stream is None:
+                                  raise SystemExit(f"unreadable archive member: {name!r}")
+                              with stream, os.fdopen(os.dup(fd), "wb") as output:
+                                  shutil.copyfileobj(stream, output, 1024 * 1024)
+                              os.fchmod(fd, member.mode & 0o7777)
+                          finally:
+                              os.close(fd)
+                          seen[name] = "file"
+                      elif member.issym():
+                          if not member.linkname or "\\" in member.linkname:
+                              raise SystemExit(f"invalid symlink: {name!r} -> {member.linkname!r}")
+                          os.symlink(member.linkname, leaf, dir_fd=parent_fd)
+                          seen[name] = "symlink"
+                      elif member.ischr():
+                          expected_device = STANDARD_DEVICES.get(name)
+                          actual_device = (member.devmajor, member.devminor)
+                          if expected_device is None or actual_device != expected_device:
+                              raise SystemExit(
+                                  f"unexpected character device: {name!r} {actual_device!r}"
+                              )
+                          os.mknod(
+                              leaf,
+                              stat.S_IFCHR | (member.mode & 0o777),
+                              os.makedev(*actual_device),
+                              dir_fd=parent_fd,
+                          )
+                          seen[name] = "device"
+                      elif member.isdev() or member.isfifo():
+                          raise SystemExit(f"unexpected special file: {name!r}")
+                      elif member.islnk():
+                          target_parts = path_parts(member.linkname)
+                          target_fd, target_leaf = open_parent(target_parts)
+                          try:
+                              info = os.stat(target_leaf, dir_fd=target_fd, follow_symlinks=False)
+                              if not stat.S_ISREG(info.st_mode):
+                                  raise SystemExit(f"hard link target is not a regular file: {member.linkname!r}")
+                              os.link(
+                                  target_leaf,
+                                  leaf,
+                                  src_dir_fd=target_fd,
+                                  dst_dir_fd=parent_fd,
+                                  follow_symlinks=False,
+                              )
+                          finally:
+                              os.close(target_fd)
+                          seen[name] = "file"
+                      else:
+                          raise SystemExit(f"unsupported archive entry type: {name!r}")
+                  finally:
+                      os.close(parent_fd)
+
+          if count < 1000:
+              raise SystemExit(f"archive unexpectedly small: {count} entries")
+          os.close(root_fd)
+          print(f"Validated and safely unpacked {count} tar members")
+          ARCHIVE_CHECK_EOF
+
+          sudo test -x "$VERIFY_DIR/usr/bin/node"
+          sudo test -x "$VERIFY_DIR/usr/bin/openclaw"
+          sudo test -x "$VERIFY_DIR/usr/local/sbin/openclaw-lxc-manager"
+          sudo test -f "$VERIFY_DIR/etc/systemd/system/openclaw-gateway.service"
+          sudo test -f "$VERIFY_DIR/etc/systemd/system/openclaw-approvals.service"
+          sudo test ! -e "$VERIFY_DIR/root/.openclaw/.env"
+          sudo test ! -e "$VERIFY_DIR/root/.openclaw/.lxc-initialized"
+          sudo cmp \
+            "$ROOTFS/root/.openclaw/openclaw.json" \
+            "$VERIFY_DIR/root/.openclaw/openclaw.json"
+          sudo cmp \
+            "$ROOTFS/etc/openclaw-build-info.json" \
+            "$VERIFY_DIR/etc/openclaw-build-info.json"
+          sudo chroot "$VERIFY_DIR" /usr/bin/node --version
+          sudo chroot "$VERIFY_DIR" /usr/bin/openclaw --version
+          sudo rm -rf "$VERIFY_DIR"
+
+          (cd "$DIST_DIR" && sha256sum "$IMAGE_NAME" >"$IMAGE_NAME.sha256")
+          (cd "$DIST_DIR" && sha256sum --check "$IMAGE_NAME.sha256")
+
+          # Proxmox-ready archive root must contain rootfs paths directly.
+          python3 - "$IMAGE_PATH" <<'ARCHIVE_ROOT_EOF'
+          import sys
+          import tarfile
+
+          with tarfile.open(sys.argv[1], "r:gz") as tf:
+              names = {member.name.removeprefix("./").split("/", 1)[0] for member in tf}
+          required = {"etc", "usr", "var", "root"}
+          missing = required - names
+          if missing:
+              raise SystemExit(f"archive is not a rootfs tree; missing: {sorted(missing)}")
+          if "rootfs" in names:
+              raise SystemExit("archive has an unwanted rootfs/ wrapper directory")
+          print("Verified Proxmox rootfs archive layout")
+          ARCHIVE_ROOT_EOF
+
+          cat >"$DIST_DIR/README.md" <<README_EOF
+          # OpenClaw LXC Ubuntu 24.04 Template
+
+          - Template version: \`$VERSION\`
+          - OpenClaw: \`$(sudo jq -r '.openclawVersion' "$ROOTFS/etc/openclaw-build-info.json")\`
+          - Base: Ubuntu 24.04 LTS (noble), amd64
+          - Runtime: Node.js \`$(sudo jq -r '.nodeVersion' "$ROOTFS/etc/openclaw-build-info.json")\`
+          - Archive: \`$IMAGE_NAME\`
+
+          ## Import into Proxmox VE
+
+          Upload \`$IMAGE_NAME\` to a Proxmox storage that supports container templates,
+          then create a new unprivileged or privileged LXC container from the template
+          according to your isolation requirements. Configure networking, DNS, storage,
+          and memory in Proxmox before starting the container.
+
+          On first boot, the first-boot unit generates a fresh Gateway token and initializes
+          state before OpenClaw Gateway starts on TCP 18789. A separate oneshot then applies
+          Gateway-host exec approvals through the running Gateway RPC.
+          Inside the container run \`openclaw-info\` to display the URL and token. Enter
+          the token in the Control UI login page; do not put it in a URL. Plain HTTP on a
+          LAN does not encrypt credentials, so use a trusted network or a TLS-terminating
+          reverse proxy.
+
+          ## High-risk permission profile
+
+          This image intentionally configures \`tools.profile=full\`, Gateway-host exec
+          with \`mode=full\`, host approvals \`security=full / ask=off\`, elevated tools,
+          and \`agents.defaults.sandbox.mode=off\`. The Gateway runs as container root.
+          This is a trusted single-operator convenience profile, not a safe multi-user
+          or hostile-agent boundary. Restrict network access and change the policy before
+          exposing it to untrusted users.
+
+          ## Maintenance
+
+          - \`openclaw-status\`, \`openclaw-logs\`, \`openclaw-restart\`
+          - \`openclaw-api-setup\` configures an OpenAI-compatible provider
+          - \`openclaw-update [version]\` updates with a state backup and rollback path
+          - \`openclaw-repair-max-permissions\` reapplies this image's high-risk policy
+
+          Verify the downloaded archive with \`$IMAGE_NAME.sha256\` before importing it.
+          README generated at $(date -u +'%Y-%m-%dT%H:%M:%SZ').
+          README_EOF
+
+          echo "模板产物："
+          ls -lh "$DIST_DIR/$IMAGE_NAME" "$DIST_DIR/$IMAGE_NAME.sha256" "$DIST_DIR/README.md"
+
+          # =====================================================================
+          # [9/9] 发布 GitHub Release，并下载附件做最终 sha256 校验
+          # =====================================================================
+          echo "=================================================="
+          echo "[9/9] 发布 GitHub Release"
+          echo "=================================================="
+
+          RELEASE_TAG="${IMAGE_PREFIX}-${VERSION}"
+          gh auth status
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "错误：Release 已存在，不覆盖：$RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --draft \
+            --title "OpenClaw LXC Ubuntu 24.04 ${VERSION}" \
+            --notes-file "$DIST_DIR/README.md" \
+            "$DIST_DIR/$IMAGE_NAME" \
+            "$DIST_DIR/$IMAGE_NAME.sha256" \
+            "$DIST_DIR/README.md"
+
+          mkdir -p "$DOWNLOAD_DIR"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$DOWNLOAD_DIR" \
+            --pattern "$IMAGE_NAME" \
+            --pattern "$IMAGE_NAME.sha256"
+          (
+            cd "$DOWNLOAD_DIR"
+            sha256sum --check "$IMAGE_NAME.sha256"
+            cmp "$IMAGE_NAME" "$DIST_DIR/$IMAGE_NAME"
+          )
+
+          # Only publish after the authenticated Release download matches the
+          # locally validated archive and checksum. A failed check leaves a draft.
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
+
+          echo "发布完成：https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
