@@ -1,0 +1,729 @@
+name: Build Jupyter Notebook LXC Ubuntu 24.04
+
+##############################################################################
+# Ubuntu 24.04 LTS / amd64 Proxmox LXC 模板：JupyterLab + Notebook
+# 中文界面、自动启动、首次启动 Token、中国镜像、禁用 DHCP/RA/IPv6，
+# 构建冒烟测试、打包校验、SHA-256 和 GitHub Release 自动发布。
+##############################################################################
+
+'on':
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "模板版本号（auto = 使用 UTC 时间戳）"
+        required: true
+        default: "auto"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jupyter-lxc-ubuntu2404-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      INPUT_VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            debootstrap ubuntu-keyring ca-certificates curl wget gnupg \
+            gzip xz-utils zstd tar jq file openssl coreutils util-linux \
+            acl attr python3 gh
+          debootstrap --version
+          gh --version
+          python3 --version
+
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Build, verify and publish Jupyter LXC template
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          VERSION="${INPUT_VERSION:-auto}"
+          if [ "$VERSION" = auto ]; then VERSION="$(date -u +'%Y.%m.%d-%H%M%S')"; fi
+          if ! [[ "$VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid template version: $VERSION" >&2
+            exit 1
+          fi
+
+          IMAGE_PREFIX=jupyter-lxc-ubuntu2404
+          IMAGE_NAME="${IMAGE_PREFIX}-${VERSION}.tar.gz"
+          WORK_DIR="$PWD/work"
+          ROOTFS="$WORK_DIR/rootfs"
+          DIST_DIR="$PWD/dist"
+          VERIFY_DIR="$WORK_DIR/archive-check"
+          DOWNLOAD_DIR="$WORK_DIR/release-download"
+          MANAGER_SCRIPT="$WORK_DIR/jupyter-lxc-manager"
+          INSTALL_SCRIPT="$WORK_DIR/install-inside-ubuntu2404.sh"
+          mkdir -p "$WORK_DIR" "$DIST_DIR"
+          for path in "$ROOTFS" "$VERIFY_DIR" "$DOWNLOAD_DIR" "$MANAGER_SCRIPT" "$INSTALL_SCRIPT"; do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              echo "Refusing to overwrite build path: $path" >&2
+              exit 1
+            fi
+          done
+          for path in "$DIST_DIR/$IMAGE_NAME" "$DIST_DIR/$IMAGE_NAME.sha256" "$DIST_DIR/README.md"; do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              echo "Refusing to overwrite artifact: $path" >&2
+              exit 1
+            fi
+          done
+
+          cleanup_mounts() {
+            if [ -d "$ROOTFS" ]; then
+              sudo umount -R -lf "$ROOTFS/dev" 2>/dev/null || true
+              sudo umount -R -lf "$ROOTFS/proc" 2>/dev/null || true
+              sudo umount -R -lf "$ROOTFS/sys" 2>/dev/null || true
+              sudo umount -lf "$ROOTFS/dev" 2>/dev/null || true
+              sudo umount -lf "$ROOTFS/proc" 2>/dev/null || true
+              sudo umount -lf "$ROOTFS/sys" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_mounts EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          cat >"$MANAGER_SCRIPT" <<'MANAGER_EOF'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          umask 077
+
+          TOKEN_FILE=/etc/jupyter/jupyter.env
+          INFO_FILE=/root/jupyter-info.txt
+          MARKER_FILE=/var/lib/jupyter/.lxc-initialized
+          BUILD_INFO=/etc/jupyter-build-info.json
+          SERVICE=jupyter.service
+          PORT=8888
+
+          log() { printf '[jupyter-lxc] %s\n' "$*"; }
+          die() { printf '[jupyter-lxc][error] %s\n' "$*" >&2; exit 1; }
+          require_root() { [ "$(id -u)" -eq 0 ] || die 'Run this command as root'; }
+          get_ipv4() {
+            ip -4 -o addr show scope global 2>/dev/null |
+              awk 'NR == 1 { split($4, a, "/"); print a[1] }' || true
+          }
+          read_token() {
+            [ -s "$TOKEN_FILE" ] || return 0
+            sed -n 's/^JUPYTER_TOKEN=//p' "$TOKEN_FILE" | tail -n 1
+          }
+          write_token() {
+            local token="$1" tmp
+            [[ "$token" =~ ^[a-f0-9]{64}$ ]] || die 'Refusing invalid token value'
+            install -d -o root -g jupyter -m 0750 /etc/jupyter
+            tmp="$(mktemp /etc/jupyter/.jupyter.env.XXXXXX)"
+            printf 'JUPYTER_TOKEN=%s\n' "$token" >"$tmp"
+            chown root:jupyter "$tmp"
+            chmod 0640 "$tmp"
+            mv -f "$tmp" "$TOKEN_FILE"
+          }
+          refresh_info() {
+            local ipv4 token version tmp
+            ipv4="$(get_ipv4)"
+            token="$(read_token)"
+            version="$(jq -r '.jupyterlabVersion // "unknown"' "$BUILD_INFO" 2>/dev/null || echo unknown)"
+            tmp="$(mktemp /root/.jupyter-info.XXXXXX)"
+            {
+              echo '============================================================'
+              echo ' JupyterLab / Notebook - Ubuntu 24.04 LTS'
+              echo '============================================================'
+              printf 'JupyterLab: %s\n' "$version"
+              echo '界面语言：简体中文（zh_CN）；时区：Asia/Shanghai'
+              echo
+              echo '访问地址：'
+              if [ -n "$ipv4" ] && [ -n "$token" ]; then
+                printf '  http://%s:%s/lab?token=%s\n' "$ipv4" "$PORT" "$token"
+              else
+                echo '  尚无全局 IPv4；请在 Proxmox 中设置静态 IPv4 后执行 jupyter-info。'
+              fi
+              echo
+              echo '访问 Token：'
+              printf '  %s\n' "${token:-尚未生成（首次启动时自动生成）}"
+              echo
+              echo '网络策略：DHCP/RA/IPv6 自动配置已禁用；请使用静态 IPv4。'
+              echo '安全提示：Token 等同登录凭据；不要分享链接或在不可信网络使用 HTTP。'
+              echo
+              echo '管理命令：jupyter-info | jupyter-status | jupyter-logs'
+              echo '          jupyter-restart | jupyter-token-reset'
+              echo '笔记目录：/srv/jupyter/notebooks'
+              echo '============================================================'
+            } >"$tmp"
+            chown root:root "$tmp"
+            chmod 0600 "$tmp"
+            mv -f "$tmp" "$INFO_FILE"
+          }
+          show_info() { refresh_info; cat "$INFO_FILE"; }
+          firstboot() {
+            install -d -o root -g jupyter -m 0750 /etc/jupyter
+            install -d -o jupyter -g jupyter -m 0750 /var/lib/jupyter /srv/jupyter/notebooks
+            if [ ! -s "$TOKEN_FILE" ]; then
+              write_token "$(openssl rand -hex 32)"
+              log 'Generated a fresh 256-bit Jupyter access token'
+            fi
+            refresh_info
+            install -o root -g root -m 0600 /dev/null "$MARKER_FILE"
+            log 'First boot initialized; access details follow (also available with jupyter-info):'
+            cat "$INFO_FILE"
+          }
+          build_init() {
+            [ -s "$TOKEN_FILE" ] || write_token "$(openssl rand -hex 32)"
+            refresh_info
+          }
+          wait_ready() {
+            local token="$1" port="${2:-$PORT}"
+            for _ in $(seq 1 60); do
+              if curl -fsS --connect-timeout 2 --max-time 5 \
+                "http://127.0.0.1:${port}/api/status?token=${token}" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
+          smoke_test() {
+            local token home log_file pid='' port=18888
+            token="$(read_token)"
+            [ -n "$token" ] || die 'Build token is missing'
+            home="$(mktemp -d /tmp/jupyter-smoke-home.XXXXXX)"
+            log_file=/tmp/jupyter-smoke.log
+            mkdir -p "$home/notebooks"
+            chown -R jupyter:jupyter "$home"
+            if ss -H -lnt "sport = :${port}" 2>/dev/null | grep -q .; then
+              die "Smoke-test port ${port} is already in use"
+            fi
+            setsid runuser -u jupyter -- env \
+              HOME="$home" JUPYTER_TOKEN="$token" JUPYTER_CONFIG_DIR=/etc/jupyter \
+              /opt/jupyter/bin/jupyter lab --config=/etc/jupyter/jupyter_server_config.py \
+              --no-browser --ip=127.0.0.1 --port="$port" --ServerApp.port_retries=0 \
+              --ServerApp.root_dir="$home/notebooks" >"$log_file" 2>&1 &
+            pid=$!
+            cleanup() {
+              if [ -n "$pid" ]; then
+                kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+                for _ in $(seq 1 15); do
+                  kill -0 "$pid" 2>/dev/null || break
+                  sleep 1
+                done
+                kill -KILL -- "-$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+              fi
+              rm -rf -- "$home"
+            }
+            trap cleanup EXIT
+            if ! wait_ready "$token" "$port"; then
+              cat "$log_file" >&2 || true
+              die 'Jupyter failed its authenticated /api/status smoke test'
+            fi
+            kill -0 "$pid" 2>/dev/null || die 'Jupyter exited after becoming ready'
+            log 'JupyterLab authenticated HTTP smoke test passed'
+            cleanup
+            trap - EXIT
+          }
+          template_reset() {
+            rm -f -- "$TOKEN_FILE" "$MARKER_FILE" "$INFO_FILE" /tmp/jupyter-smoke.log
+            log 'Removed build token, first-boot marker and root login details'
+          }
+          show_status() {
+            echo '=== Jupyter systemd service ==='
+            systemctl status "$SERVICE" --no-pager || true
+            echo '=== Versions ==='
+            /opt/jupyter/bin/jupyter lab --version || true
+            /opt/jupyter/bin/jupyter notebook --version || true
+            /usr/bin/python3 --version || true
+            echo '=== IPv4 listener ==='
+            ss -lntp | grep ":${PORT}" || true
+            show_info
+          }
+          reset_token() {
+            write_token "$(openssl rand -hex 32)"
+            systemctl restart "$SERVICE"
+            wait_ready "$(read_token)" "$PORT" || die 'Jupyter did not become ready after token reset'
+            show_info
+          }
+
+          require_root
+          invoked="$(basename "$0")"
+          if [ "$invoked" = jupyter-lxc-manager ]; then
+            command_name="${1:-help}"
+            [ "$#" -eq 0 ] || shift
+          else
+            command_name="$invoked"
+          fi
+          case "$command_name" in
+            firstboot) firstboot ;;
+            build-init) build_init ;;
+            smoke-test) smoke_test ;;
+            template-reset) template_reset ;;
+            jupyter-info|info) show_info ;;
+            jupyter-status|status) show_status ;;
+            jupyter-logs|logs) exec journalctl -u "$SERVICE" -f ;;
+            jupyter-restart|restart)
+              systemctl restart "$SERVICE"
+              wait_ready "$(read_token)" "$PORT" || die 'Jupyter did not become ready'
+              show_info
+              ;;
+            jupyter-token-reset|token-reset) reset_token ;;
+            *)
+              cat <<'USAGE'
+          Jupyter LXC manager (run as root)
+            jupyter-info          Show the URL and access token
+            jupyter-status        Show service, versions and address
+            jupyter-logs          Follow service logs
+            jupyter-restart       Restart JupyterLab
+            jupyter-token-reset   Rotate the token and restart JupyterLab
+          USAGE
+              exit 1
+              ;;
+          esac
+          MANAGER_EOF
+          chmod 0755 "$MANAGER_SCRIPT"
+
+          cat >"$INSTALL_SCRIPT" <<'INSTALL_EOF'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          umask 022
+          export DEBIAN_FRONTEND=noninteractive
+          TEMPLATE_VERSION="${TEMPLATE_VERSION:?TEMPLATE_VERSION is required}"
+
+          # Mainland China Ubuntu mirror, used both during provisioning and in the guest.
+          find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -print0 |
+            xargs -0 -r sed -i -E \
+              's#https?://[^/]*(archive|security).ubuntu.com/ubuntu/?#https://mirrors.tuna.tsinghua.edu.cn/ubuntu#g'
+
+          # debootstrap may configure only Ubuntu's "main" component for
+          # noble. python3-venv is in "universe", and the updates/security
+          # pockets also need "main" so python3 and python3.12-venv are upgraded
+          # together instead of mixing incompatible package versions.
+          cat >/etc/apt/sources.list.d/ubuntu-universe.sources <<'APT_UNIVERSE_EOF'
+          Types: deb
+          URIs: https://mirrors.tuna.tsinghua.edu.cn/ubuntu
+          Suites: noble
+          Components: universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: https://mirrors.tuna.tsinghua.edu.cn/ubuntu
+          Suites: noble-updates noble-security
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          APT_UNIVERSE_EOF
+
+          cat >/usr/sbin/policy-rc.d <<'POLICY_EOF'
+          #!/bin/sh
+          exit 101
+          POLICY_EOF
+          chmod 0755 /usr/sbin/policy-rc.d
+          apt-get update
+          apt-cache policy python3-venv
+          if ! apt-cache policy python3-venv | awk '$1 == "Candidate:" && $2 != "(none)" { found = 1 } END { exit !found }'; then
+            echo 'python3-venv has no APT candidate; check enabled Ubuntu components and mirror indexes.' >&2
+            exit 1
+          fi
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl jq openssl iproute2 iputils-ping procps psmisc \
+            util-linux sed gawk grep coreutils findutils tar gzip xz-utils \
+            locales tzdata systemd systemd-sysv dbus dbus-user-session \
+            python3 python3-venv language-pack-zh-hans language-pack-zh-hans-base \
+            fonts-noto-cjk
+
+          # Remove DHCP client software if it was pulled in by a dependency.
+          for package in isc-dhcp-client isc-dhcp-common dhcpcd dhcpcd5 dhcpcd-base udhcpc network-manager; do
+            if [ "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)" = installed ]; then
+              apt-get purge -y "$package"
+            fi
+          done
+
+          if ! grep -Eq '^#? *zh_CN.UTF-8 UTF-8$' /etc/locale.gen; then
+            printf '%s\n' 'zh_CN.UTF-8 UTF-8' >>/etc/locale.gen
+          fi
+          sed -i -E 's/^# *zh_CN.UTF-8 UTF-8$/zh_CN.UTF-8 UTF-8/' /etc/locale.gen
+          locale-gen zh_CN.UTF-8
+          update-locale LANG=zh_CN.UTF-8 LANGUAGE=zh_CN:zh
+          ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          printf '%s\n' 'Asia/Shanghai' >/etc/timezone
+
+          # Disable IPv6, RA, SLAAC, link-local and DHCPv6 at kernel level.
+          install -d -m 0755 /etc/sysctl.d
+          cat >/etc/sysctl.d/99-jupyter-lxc-network.conf <<'SYSCTL_EOF'
+          net.ipv6.conf.all.disable_ipv6 = 1
+          net.ipv6.conf.default.disable_ipv6 = 1
+          net.ipv6.conf.lo.disable_ipv6 = 1
+          net.ipv6.conf.eth0.disable_ipv6 = 1
+          net.ipv6.conf.all.accept_ra = 0
+          net.ipv6.conf.default.accept_ra = 0
+          net.ipv6.conf.eth0.accept_ra = 0
+          net.ipv6.conf.all.autoconf = 0
+          net.ipv6.conf.default.autoconf = 0
+          net.ipv6.conf.eth0.autoconf = 0
+          net.ipv6.conf.all.use_tempaddr = 0
+          net.ipv6.conf.default.use_tempaddr = 0
+          SYSCTL_EOF
+          # Proxmox configures Ubuntu LXC networking before each start through
+          # systemd-networkd. Its generated .network file uses DHCP=no unless
+          # Proxmox DHCP is explicitly selected, and IPv6AcceptRA=false unless
+          # IPv6 auto/DHCP is selected. Keep systemd-networkd available so the
+          # Proxmox-configured static IPv4 is brought up; DHCP clients are purged.
+
+          echo 'Acquire::Retries "3";' >/etc/apt/apt.conf.d/80-retries
+          python3 -m venv /opt/jupyter
+          cat >/etc/pip.conf <<'PIP_EOF'
+          [global]
+          index-url = https://pypi.tuna.tsinghua.edu.cn/simple
+          timeout = 60
+          PIP_EOF
+          /opt/jupyter/bin/python -m pip install --upgrade pip
+          /opt/jupyter/bin/python -m pip install \
+            'jupyterlab>=4.5,<4.6' 'notebook>=7,<8' \
+            'jupyterlab-language-pack-zh-CN>=4.5,<4.6' ipykernel \
+            numpy pandas matplotlib scipy scikit-learn requests
+
+          useradd --system --home-dir /var/lib/jupyter --create-home \
+            --shell /usr/sbin/nologin --user-group jupyter
+          install -d -o root -g jupyter -m 0750 /etc/jupyter
+          install -d -o jupyter -g jupyter -m 0750 \
+            /var/lib/jupyter /srv/jupyter /srv/jupyter/notebooks
+          install -d -o root -g root -m 0755 /opt/jupyter/share/jupyter/lab/settings
+          cat >/opt/jupyter/share/jupyter/lab/settings/overrides.json <<'OVERRIDES_EOF'
+          {
+            "@jupyterlab/translation-extension:plugin": {
+              "locale": "zh_CN"
+            }
+          }
+          OVERRIDES_EOF
+          chmod 0644 /opt/jupyter/share/jupyter/lab/settings/overrides.json
+          test -s /opt/jupyter/lib/python*/site-packages/jupyterlab_language_pack_zh_CN/locale/zh_CN/LC_MESSAGES/jupyterlab.json
+
+          cat >/etc/jupyter/jupyter_server_config.py <<'JUPYTER_CONFIG_EOF'
+          import os
+          c.ServerApp.ip = "0.0.0.0"
+          c.ServerApp.port = 8888
+          c.ServerApp.open_browser = False
+          c.ServerApp.allow_remote_access = True
+          c.ServerApp.root_dir = "/srv/jupyter/notebooks"
+          c.ServerApp.terminals_enabled = True
+          c.IdentityProvider.token = os.environ.get("JUPYTER_TOKEN", "")
+          JUPYTER_CONFIG_EOF
+          chown root:jupyter /etc/jupyter/jupyter_server_config.py
+          chmod 0640 /etc/jupyter/jupyter_server_config.py
+          runuser -u jupyter -- test -r /etc/jupyter/jupyter_server_config.py
+
+          install -d -o root -g root -m 0755 /usr/local/sbin /usr/local/bin /usr/local/libexec
+          install -o root -g root -m 0755 /root/jupyter-lxc-manager /usr/local/sbin/jupyter-lxc-manager
+          for command_name in jupyter-info jupyter-status jupyter-logs jupyter-restart jupyter-token-reset; do
+            ln -sfn /usr/local/sbin/jupyter-lxc-manager "/usr/local/bin/${command_name}"
+          done
+
+          cat >/etc/systemd/system/jupyter-firstboot.service <<'FIRSTBOOT_UNIT_EOF'
+          [Unit]
+          Description=Initialize Jupyter LXC instance and generate access token
+          After=local-fs.target
+          Before=jupyter.service
+          ConditionPathExists=!/var/lib/jupyter/.lxc-initialized
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/jupyter-lxc-manager firstboot
+          RemainAfterExit=yes
+          TimeoutStartSec=60
+
+          [Install]
+          WantedBy=multi-user.target
+          FIRSTBOOT_UNIT_EOF
+
+          cat >/etc/systemd/system/jupyter.service <<'JUPYTER_UNIT_EOF'
+          [Unit]
+          Description=JupyterLab and Notebook server
+          After=network.target jupyter-firstboot.service
+          Requires=jupyter-firstboot.service
+          StartLimitIntervalSec=300
+          StartLimitBurst=10
+
+          [Service]
+          Type=simple
+          User=jupyter
+          Group=jupyter
+          WorkingDirectory=/srv/jupyter/notebooks
+          Environment=HOME=/var/lib/jupyter
+          Environment=LANG=zh_CN.UTF-8
+          Environment=LC_ALL=zh_CN.UTF-8
+          Environment=TZ=Asia/Shanghai
+          EnvironmentFile=/etc/jupyter/jupyter.env
+          ExecStart=/opt/jupyter/bin/jupyter lab --config=/etc/jupyter/jupyter_server_config.py --no-browser --ip=0.0.0.0 --port=8888
+          Restart=on-failure
+          RestartSec=5
+          TimeoutStartSec=120
+          TimeoutStopSec=30
+          UMask=0077
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectSystem=strict
+          ProtectHome=true
+          ProtectKernelTunables=true
+          ProtectKernelModules=true
+          ProtectControlGroups=true
+          RestrictSUIDSGID=true
+          LockPersonality=true
+          ReadWritePaths=/srv/jupyter/notebooks /var/lib/jupyter
+
+          [Install]
+          WantedBy=multi-user.target
+          JUPYTER_UNIT_EOF
+
+          # Show login details only in the root login MOTD.
+          install -d -o root -g root -m 0755 /etc/update-motd.d
+          cat >/etc/update-motd.d/99-jupyter-info <<'MOTD_EOF'
+          #!/bin/sh
+          [ "$(id -u)" -eq 0 ] || exit 0
+          [ -x /usr/local/sbin/jupyter-lxc-manager ] && /usr/local/sbin/jupyter-lxc-manager info
+          MOTD_EOF
+          chmod 0755 /etc/update-motd.d/99-jupyter-info
+
+          printf '%s\n' jupyter >/etc/hostname
+          cat >/etc/hosts <<'HOSTS_EOF'
+          127.0.0.1 localhost
+          127.0.1.1 jupyter
+          HOSTS_EOF
+          rm -f /etc/machine-id /var/lib/dbus/machine-id
+          install -d -o root -g root -m 0755 /var/lib/dbus
+          : >/etc/machine-id
+          chmod 0444 /etc/machine-id
+          ln -s /etc/machine-id /var/lib/dbus/machine-id
+
+          JUPYTERLAB_VERSION="$(/opt/jupyter/bin/jupyter lab --version)"
+          NOTEBOOK_VERSION="$(/opt/jupyter/bin/jupyter notebook --version)"
+          PYTHON_VERSION="$(/opt/jupyter/bin/python --version 2>&1)"
+          jq -n \
+            --arg templateVersion "$TEMPLATE_VERSION" \
+            --arg jupyterlabVersion "$JUPYTERLAB_VERSION" \
+            --arg notebookVersion "$NOTEBOOK_VERSION" \
+            --arg pythonVersion "$PYTHON_VERSION" \
+            --arg builtAt "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            '{templateVersion:$templateVersion,jupyterlabVersion:$jupyterlabVersion,notebookVersion:$notebookVersion,pythonVersion:$pythonVersion,distribution:"Ubuntu 24.04 LTS",codename:"noble",architecture:"amd64",locale:"zh_CN.UTF-8",timezone:"Asia/Shanghai",builtAt:$builtAt}' \
+            >/etc/jupyter-build-info.json
+          chmod 0644 /etc/jupyter-build-info.json
+
+          rm -f /usr/sbin/policy-rc.d
+          rm -f /etc/resolv.conf
+          : >/etc/resolv.conf
+          chmod 0644 /etc/resolv.conf
+          apt-get clean
+          rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/*
+          rm -f /root/.bash_history /root/.wget-hsts
+          rm -rf /root/.ssh
+          echo "Provisioned JupyterLab ${JUPYTERLAB_VERSION}, Notebook ${NOTEBOOK_VERSION}, ${PYTHON_VERSION}"
+          INSTALL_EOF
+          chmod 0755 "$INSTALL_SCRIPT"
+
+          echo '[1/6] debootstrap Ubuntu 24.04 noble amd64 from TUNA mirror'
+          mkdir -p "$ROOTFS"
+          sudo debootstrap --arch=amd64 --variant=minbase \
+            --keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg \
+            noble "$ROOTFS" https://mirrors.tuna.tsinghua.edu.cn/ubuntu
+
+          echo '[2/6] Mount chroot filesystems'
+          sudo install -d "$ROOTFS/dev/pts" "$ROOTFS/proc" "$ROOTFS/sys" "$ROOTFS/run"
+          sudo rm -f "$ROOTFS/etc/resolv.conf"
+          sudo install -m 0644 /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
+          sudo mount -t proc proc "$ROOTFS/proc"
+          sudo mount --rbind /sys "$ROOTFS/sys"
+          sudo mount --make-rslave "$ROOTFS/sys"
+          sudo mount --rbind /dev "$ROOTFS/dev"
+          sudo mount --make-rslave "$ROOTFS/dev"
+
+          echo '[3/6] Install Jupyter, Chinese locale and systemd services'
+          sudo install -o root -g root -m 0755 "$MANAGER_SCRIPT" "$ROOTFS/root/jupyter-lxc-manager"
+          sudo install -o root -g root -m 0755 "$INSTALL_SCRIPT" "$ROOTFS/root/install-inside-ubuntu2404.sh"
+          sudo chroot "$ROOTFS" /usr/bin/env TEMPLATE_VERSION="$VERSION" \
+            /bin/bash /root/install-inside-ubuntu2404.sh
+          sudo systemctl --root="$ROOTFS" enable jupyter-firstboot.service jupyter.service
+          sudo chroot "$ROOTFS" systemd-analyze verify \
+            /etc/systemd/system/jupyter-firstboot.service \
+            /etc/systemd/system/jupyter.service
+          sudo chroot "$ROOTFS" /bin/bash -n /usr/local/sbin/jupyter-lxc-manager
+          sudo chroot "$ROOTFS" /usr/bin/python3 -m json.tool \
+            /opt/jupyter/share/jupyter/lab/settings/overrides.json >/dev/null
+
+          echo '[4/6] Initialize a temporary token and smoke-test Jupyter'
+          sudo chroot "$ROOTFS" /usr/local/sbin/jupyter-lxc-manager build-init
+          sudo chroot "$ROOTFS" /usr/local/sbin/jupyter-lxc-manager smoke-test
+          sudo chroot "$ROOTFS" /usr/local/sbin/jupyter-lxc-manager template-reset
+
+          echo '[5/6] Clean template instance state and build residue'
+          sudo rm -f "$ROOTFS/root/jupyter-lxc-manager" \
+            "$ROOTFS/root/install-inside-ubuntu2404.sh" \
+            "$ROOTFS/etc/resolv.conf" "$ROOTFS/var/lib/systemd/random-seed"
+          sudo install -o root -g root -m 0644 /dev/null "$ROOTFS/etc/resolv.conf"
+          sudo find "$ROOTFS/var/log" -type f -exec truncate -s 0 {} \;
+          sudo find "$ROOTFS" -xdev \( -name '.cache' -o -name '__pycache__' \) \
+            -type d -prune -exec rm -rf -- {} +
+          sudo rm -rf "$ROOTFS/var/lib/apt/lists"/* "$ROOTFS/var/cache/apt/archives"/*
+          sudo rm -f "$ROOTFS/etc/ssh/ssh_host_"* 2>/dev/null || true
+          sudo rm -f "$ROOTFS/etc/machine-id" "$ROOTFS/var/lib/dbus/machine-id"
+          sudo install -o root -g root -m 0444 /dev/null "$ROOTFS/etc/machine-id"
+          sudo ln -s /etc/machine-id "$ROOTFS/var/lib/dbus/machine-id"
+          sudo sync
+          cleanup_mounts
+          trap - EXIT INT TERM
+
+          sudo test ! -e "$ROOTFS/etc/jupyter/jupyter.env"
+          sudo test ! -e "$ROOTFS/var/lib/jupyter/.lxc-initialized"
+          sudo test ! -e "$ROOTFS/root/jupyter-info.txt"
+          sudo test -L "$ROOTFS/etc/systemd/system/multi-user.target.wants/jupyter.service"
+          sudo grep -q 'disable_ipv6 = 1' "$ROOTFS/etc/sysctl.d/99-jupyter-lxc-network.conf"
+          sudo grep -q 'accept_ra = 0' "$ROOTFS/etc/sysctl.d/99-jupyter-lxc-network.conf"
+          for unit in systemd-networkd.service systemd-networkd.socket; do
+            if [ -L "$ROOTFS/etc/systemd/system/$unit" ] && \
+              [ "$(readlink "$ROOTFS/etc/systemd/system/$unit")" = /dev/null ]; then
+              echo "Proxmox network unit is unexpectedly masked: $unit" >&2
+              exit 1
+            fi
+          done
+          for package in isc-dhcp-client isc-dhcp-common dhcpcd dhcpcd5 dhcpcd-base udhcpc network-manager; do
+            if sudo chroot "$ROOTFS" dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null | grep -qx installed; then
+              echo "Unexpected DHCP/network manager package in rootfs: $package" >&2
+              exit 1
+            fi
+          done
+
+          echo '[6/6] Pack, verify archive, checksum and publish Release'
+          IMAGE_PATH="$DIST_DIR/$IMAGE_NAME"
+          sudo tar --numeric-owner --acls --xattrs --xattrs-include='*' \
+            --hard-dereference --sparse -czf "$IMAGE_PATH" -C "$ROOTFS" .
+
+          python3 - "$IMAGE_PATH" <<'ARCHIVE_CHECK_EOF'
+          import sys, tarfile
+          from pathlib import PurePosixPath
+
+          archive = sys.argv[1]
+          required = {
+              'etc/systemd/system/jupyter.service',
+              'etc/systemd/system/jupyter-firstboot.service',
+              'etc/jupyter/jupyter_server_config.py',
+              'etc/sysctl.d/99-jupyter-lxc-network.conf',
+              'opt/jupyter/bin/jupyter',
+              'opt/jupyter/share/jupyter/lab/settings/overrides.json',
+              'etc/jupyter-build-info.json',
+          }
+          seen = set()
+          count = 0
+          with tarfile.open(archive, 'r:gz') as tf:
+              for member in tf:
+                  count += 1
+                  path = PurePosixPath(member.name)
+                  if path.is_absolute() or '..' in path.parts:
+                      raise SystemExit(f'unsafe path in archive: {member.name!r}')
+                  name = '/'.join(part for part in path.parts if part not in ('', '.', '/'))
+                  if name:
+                      seen.add(name)
+                  if member.isfile():
+                      stream = tf.extractfile(member)
+                      if stream is None:
+                          raise SystemExit(f'unreadable archive member: {member.name!r}')
+                      size = 0
+                      while chunk := stream.read(1024 * 1024):
+                          size += len(chunk)
+                      if size != member.size:
+                          raise SystemExit(f'truncated archive member: {member.name!r}')
+                  elif member.issym():
+                      if not member.linkname:
+                          raise SystemExit(f'empty symlink target: {member.name!r}')
+                  elif member.islnk():
+                      target = PurePosixPath(member.linkname)
+                      if target.is_absolute() or '..' in target.parts:
+                          raise SystemExit(f'unsafe hardlink target: {member.linkname!r}')
+                  elif not (member.isdir() or member.ischr()):
+                      raise SystemExit(f'unexpected archive entry: {member.name!r}')
+          missing = required - seen
+          if missing:
+              raise SystemExit(f'missing required template files: {sorted(missing)}')
+          if count < 1000:
+              raise SystemExit(f'archive unexpectedly small: {count} entries')
+          print(f'Validated and fully read {count} archive members')
+          ARCHIVE_CHECK_EOF
+
+          (cd "$DIST_DIR" && sha256sum "$IMAGE_NAME" >"$IMAGE_NAME.sha256")
+          (cd "$DIST_DIR" && sha256sum --check "$IMAGE_NAME.sha256")
+          python3 - "$IMAGE_PATH" <<'ARCHIVE_ROOT_EOF'
+          import sys, tarfile
+          with tarfile.open(sys.argv[1], 'r:gz') as archive:
+              roots = {m.name.removeprefix('./').split('/', 1)[0] for m in archive}
+          required = {'etc', 'usr', 'opt', 'var', 'srv', 'root'}
+          if required - roots or 'rootfs' in roots:
+              raise SystemExit(f'not a direct Proxmox rootfs archive: {roots}')
+          print('Verified Proxmox rootfs archive layout')
+          ARCHIVE_ROOT_EOF
+
+          JUPYTERLAB_VERSION="$(sudo jq -r '.jupyterlabVersion' "$ROOTFS/etc/jupyter-build-info.json")"
+          NOTEBOOK_VERSION="$(sudo jq -r '.notebookVersion' "$ROOTFS/etc/jupyter-build-info.json")"
+          cat >"$DIST_DIR/README.md" <<README_EOF
+          # JupyterLab / Notebook LXC - Ubuntu 24.04
+
+          - Template: \`$VERSION\`
+          - JupyterLab: \`$JUPYTERLAB_VERSION\`
+          - Notebook: \`$NOTEBOOK_VERSION\`
+          - Base: Ubuntu 24.04 LTS (noble), amd64
+          - Archive: \`$IMAGE_NAME\`
+
+          ## Proxmox network setup (important)
+
+          DHCP, IPv6, SLAAC and Router Advertisements are disabled. The guest does not request
+          any IPv4/IPv6 address. In Proxmox CT network settings, assign a **static IPv4**
+          address and gateway (or configure the equivalent static address on the host-managed
+          veth). Do not select DHCP. IPv6 should be unset. Configure DNS statically in Proxmox.
+          Without a static IPv4 the service runs, but there is no remote access URL.
+
+          ## Access and first boot
+
+          JupyterLab is enabled for automatic startup on TCP 8888. First boot generates a
+          random 256-bit token. The first-boot journal and root login MOTD show the access URL;
+          run \`jupyter-info\` as root to display it again. Use \`jupyter-status\` for service
+          status, \`jupyter-logs\` for logs, and \`jupyter-token-reset\` to rotate the token.
+          Token and saved login information are readable only by root/Jupyter service.
+
+          The URL uses plain HTTP. Keep port 8888 on a trusted network or place Jupyter behind
+          a TLS-terminating reverse proxy. Never share the token-bearing URL.
+
+          ## Included environment
+
+          Simplified Chinese language pack and default JupyterLab locale, Python virtualenv,
+          ipykernel, NumPy, pandas, Matplotlib, SciPy, scikit-learn and requests. Python package
+          installs use the Tsinghua PyPI mirror; Ubuntu packages use the Tsinghua Ubuntu mirror.
+          Locale is zh_CN.UTF-8, timezone is Asia/Shanghai, notebooks live under
+          \`/srv/jupyter/notebooks\`.
+
+          Verify the archive with \`$IMAGE_NAME.sha256\` before importing it.
+          README generated at $(date -u +'%Y-%m-%dT%H:%M:%SZ').
+          README_EOF
+
+          ls -lh "$DIST_DIR/$IMAGE_NAME" "$DIST_DIR/$IMAGE_NAME.sha256" "$DIST_DIR/README.md"
+          RELEASE_TAG="${IMAGE_PREFIX}-${VERSION}"
+          gh auth status
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists; refusing to overwrite: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --draft \
+            --title "Jupyter Notebook LXC Ubuntu 24.04 ${VERSION}" \
+            --notes-file "$DIST_DIR/README.md" \
+            "$DIST_DIR/$IMAGE_NAME" "$DIST_DIR/$IMAGE_NAME.sha256" "$DIST_DIR/README.md"
+          mkdir -p "$DOWNLOAD_DIR"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --dir "$DOWNLOAD_DIR" --pattern "$IMAGE_NAME" --pattern "$IMAGE_NAME.sha256"
+          (cd "$DOWNLOAD_DIR" && sha256sum --check "$IMAGE_NAME.sha256" && cmp "$IMAGE_NAME" "$DIST_DIR/$IMAGE_NAME")
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "Published: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
