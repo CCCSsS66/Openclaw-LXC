@@ -1,0 +1,1580 @@
+name: Build OpenClaw LXC Debian 13 Template
+
+##############################################################################
+# OpenClaw Debian 13 LXC template (Proxmox VE)
+#
+# Contract baseline: current official documentation, reviewed 2026-11-21
+#   https://docs.openclaw.ai/install
+#   https://docs.openclaw.ai/install/node
+#   https://docs.openclaw.ai/platforms/linux
+#   https://docs.openclaw.ai/gateway
+#   https://docs.openclaw.ai/gateway/health
+#   https://docs.openclaw.ai/gateway/config-gateway
+#   https://docs.openclaw.ai/cli/gateway/service
+#   https://docs.openclaw.ai/install/updating/update-methods
+#
+# What this workflow does
+#   [1/10] install host build dependencies and current Debian bootstrap tools
+#   [2/10] generate the in-container manager and installer
+#   [3/10] debootstrap Debian 13 (trixie) amd64 minbase
+#   [4/10] mount proc/sys/dev and provide build DNS
+#   [5/10] install Debian packages, Node.js 24 LTS and openclaw@<exact>
+#   [6/10] enable and verify the systemd units
+#   [7/10] exercise first boot, reset instance state, run isolated probes
+#   [8/10] clean, package, checksum and extraction-verify the rootfs
+#   [9/10] publish the GitHub release and download-verify the asset
+#   [10/10] summary
+#
+# Runtime contract
+#   * Debian 13 trixie, amd64, systemd.
+#   * Node 24 LTS from NodeSource; require the documented security floor
+#     24.22.1+ (or 26.12.1+ if the 24.x line moves).
+#   * npm global install exactly as documented:
+#       npm install -g openclaw@<version> --allow-scripts=openclaw
+#     on npm 11.16+/12; omit --allow-scripts on npm 11.15 and earlier.
+#   * Gateway runs as the unprivileged "openclaw" account under a hand-written
+#     system unit. The docs state that a system unit without User= runs as
+#     root, and that running the Gateway and its agent commands as root is
+#     unsupported for this setup.
+#   * Unit policy follows the documented Linux sample: Restart=always,
+#     RestartSec=5, RestartPreventExitStatus=78, TimeoutStartSec=30,
+#     TimeoutStopSec=330, SuccessExitStatus=0 143, OOMPolicy=continue,
+#     KillMode=mixed, Delegate=yes, DelegateSubgroup=gateway.
+#   * OPENCLAW_SUPERVISOR_MODE=external and
+#     OPENCLAW_SERVICE_REPAIR_POLICY=external tell OpenClaw that this system
+#     unit owns lifecycle operations. The manager stops/starts through systemd
+#     and performs npm-based updates itself.
+#   * Config uses only documented keys: gateway.mode=local, gateway.bind=lan,
+#     gateway.auth.mode=token with ${OPENCLAW_GATEWAY_TOKEN} substitution,
+#     agents.defaults.workspace, tools.profile=full and tools.exec.mode=auto.
+#     controlUi.allowedOrigins is intentionally unset: current docs accept
+#     private same-origin LAN loads and document allowedOrigins as an override.
+#   * Probes: /healthz (liveness), /startupz (startup settled), /readyz
+#     (traffic admission). The smoke test requires all three to return 200.
+#   * No Gateway token, model API key, device identity or SQLite state is
+#     baked into the image. The token is generated on first boot into
+#     /home/openclaw/.openclaw/.env (0600), and openclaw.json keeps only the
+#     ${OPENCLAW_GATEWAY_TOKEN} reference.
+#
+# Artifacts
+#   dist/openclaw-lxc-debian13-<version>.tar.gz
+#   dist/openclaw-lxc-debian13-<version>.tar.gz.sha256
+#   dist/README.md (also published as a release asset)
+#
+# Import into Proxmox VE
+#   pct create 100 local:vztmpl/openclaw-lxc-debian13-<version>.tar.gz ...
+##############################################################################
+
+'on':
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Template version (auto = UTC timestamp)"
+        required: true
+        default: "auto"
+      openclaw_version:
+        description: "OpenClaw version (latest or exact, e.g. 2026.11.6)"
+        required: true
+        default: "latest"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: openclaw-lxc-debian13-${{ inputs.version }}-${{ inputs.openclaw_version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      INPUT_VERSION: ${{ inputs.version }}
+      INPUT_OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v7
+
+      - name: Build and publish the Debian 13 template
+        shell: bash
+        run: |
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          # -----------------------------------------------------------------------------
+          # Inputs
+          # -----------------------------------------------------------------------------
+          export DEBIAN_FRONTEND=noninteractive
+
+          VERSION="${INPUT_VERSION:-auto}"
+          OPENCLAW_VERSION="${INPUT_OPENCLAW_VERSION:-latest}"
+
+          if [ "$VERSION" = "auto" ]; then
+            VERSION="$(date -u +'%Y.%m.%d-%H%M%S')"
+          fi
+
+          if [[ ! "$VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "error: version may only contain letters, digits, dot, underscore and hyphen" >&2
+            exit 1
+          fi
+
+          if [ -z "$OPENCLAW_VERSION" ]; then
+            echo "error: openclaw_version must not be empty" >&2
+            exit 1
+          fi
+
+          if [[ ! "$OPENCLAW_VERSION" =~ ^(latest|[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?)$ ]]; then
+            echo "error: openclaw_version must be 'latest' or an exact semantic version" >&2
+            exit 1
+          fi
+
+          IMAGE_PREFIX="openclaw-lxc-debian13"
+          IMAGE_NAME="${IMAGE_PREFIX}-${VERSION}.tar.gz"
+          TAG="${IMAGE_PREFIX}-${VERSION}"
+
+          WORK_DIR="$PWD/work"
+          ROOTFS="$WORK_DIR/rootfs"
+          DIST_DIR="$PWD/dist"
+          VERIFY_DIR="$WORK_DIR/archive-check"
+          DOWNLOAD_DIR="$WORK_DIR/release-download"
+          MANAGER_SCRIPT="$WORK_DIR/openclaw-manager"
+          INSTALL_SCRIPT="$WORK_DIR/install-openclaw.sh"
+
+          mkdir -p "$WORK_DIR" "$DIST_DIR"
+
+          for path in \
+            "$WORK_DIR/rootfs" \
+            "$VERIFY_DIR" \
+            "$DOWNLOAD_DIR" \
+            "$DIST_DIR/$IMAGE_NAME" \
+            "$DIST_DIR/$IMAGE_NAME.sha256" \
+            "$DIST_DIR/README.md"; do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              echo "error: refusing to overwrite existing path: $path" >&2
+              exit 1
+            fi
+          done
+
+          cleanup_mounts() {
+            if [ -n "${ROOTFS:-}" ] && [ -d "$ROOTFS" ]; then
+              sudo umount -R -lf "$ROOTFS/dev" 2>/dev/null || true
+              sudo umount -R -lf "$ROOTFS/sys" 2>/dev/null || true
+              sudo umount -R -lf "$ROOTFS/proc" 2>/dev/null || true
+              sudo umount -lf "$ROOTFS/dev/pts" 2>/dev/null || true
+              sudo umount -lf "$ROOTFS/dev" 2>/dev/null || true
+              sudo umount -lf "$ROOTFS/sys" 2>/dev/null || true
+              sudo umount -lf "$ROOTFS/proc" 2>/dev/null || true
+            fi
+          }
+
+          trap cleanup_mounts EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          # =============================================================================
+          # [1/10] Host build dependencies
+          # =============================================================================
+          echo "=================================================="
+          echo "[1/10] Installing host build dependencies"
+          echo "=================================================="
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            curl \
+            wget \
+            gnupg \
+            gpgv \
+            xz-utils \
+            zstd \
+            gzip \
+            tar \
+            jq \
+            file \
+            openssl \
+            coreutils \
+            util-linux \
+            acl \
+            attr \
+            debootstrap \
+            debian-archive-keyring \
+            distro-info
+
+          # The Ubuntu runner's debootstrap and Debian keyring may predate Debian 13.
+          # Install the current Debian packages from the official pool.
+          fetch_pool_deb() {
+            local package="$1" directory="$2" file
+            file="$(curl -fsSL "https://deb.debian.org/debian/pool/main/${directory}/${package}/" |
+              grep -oE "${package}_[0-9][^_]*_all\\.deb" | sort -uV | tail -n 1)"
+            [ -n "$file" ] || {
+              echo "error: could not resolve the latest ${package} package" >&2
+              return 1
+            }
+            curl -fsSL -o "$WORK_DIR/$file" \
+              "https://deb.debian.org/debian/pool/main/${directory}/${package}/${file}"
+            printf '%s\n' "$WORK_DIR/$file"
+          }
+
+          DEBOOTSTRAP_DEB="$(fetch_pool_deb debootstrap d)"
+          KEYRING_DEB="$(fetch_pool_deb debian-archive-keyring d)"
+          sudo dpkg -i --force-confnew --force-downgrade "$DEBOOTSTRAP_DEB" "$KEYRING_DEB"
+          sudo apt-get -f install -y
+
+          debootstrap --version
+
+          # Resolve "latest" once, so the artifact name, build metadata and installed
+          # package all refer to the same immutable OpenClaw release.
+          if [ "$OPENCLAW_VERSION" = "latest" ]; then
+            OPENCLAW_VERSION="$(curl -fsSL https://registry.npmjs.org/openclaw/latest | jq -r '.version')"
+            if [ -z "$OPENCLAW_VERSION" ] || [ "$OPENCLAW_VERSION" = "null" ]; then
+              echo "error: could not resolve the latest openclaw version from npm" >&2
+              exit 1
+            fi
+          fi
+
+          echo "Template version: $VERSION"
+          echo "OpenClaw version: $OPENCLAW_VERSION"
+
+          # =============================================================================
+          # [2/10] Generate the in-container manager and installer
+          # =============================================================================
+          echo "=================================================="
+          echo "[2/10] Generating in-container scripts"
+          echo "=================================================="
+
+          cat >"$MANAGER_SCRIPT" <<'MANAGER_EOF'
+          #!/usr/bin/env bash
+          # =============================================================================
+          # OpenClaw Debian 13 LXC manager
+          #
+          # Installed at /usr/local/sbin/openclaw-manager and exposed through the
+          # /usr/local/bin/openclaw-* shortcuts. The Gateway itself runs as the
+          # unprivileged "openclaw" account under the openclaw-gateway.service system
+          # unit; this helper runs as root and drops privileges for all OpenClaw CLI
+          # operations.
+          #
+          # Reference: https://docs.openclaw.ai/install
+          #            https://docs.openclaw.ai/platforms/linux
+          #            https://docs.openclaw.ai/gateway
+          # =============================================================================
+          set -Eeuo pipefail
+
+          umask 077
+
+          OPENCLAW_USER="openclaw"
+          OPENCLAW_HOME="/home/openclaw"
+          STATE_DIR="$OPENCLAW_HOME/.openclaw"
+          CONFIG_FILE="$STATE_DIR/openclaw.json"
+          ENV_FILE="$STATE_DIR/.env"
+          MARKER_FILE="$STATE_DIR/.initialized"
+          BACKUP_DIR="/var/backups/openclaw"
+          INFO_FILE="/root/openclaw-info.txt"
+          BUILD_INFO_FILE="/etc/openclaw-build-info.json"
+          UNIT="openclaw-gateway.service"
+          PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
+          OPENCLAW_BIN="/usr/bin/openclaw"
+          PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          export PATH
+
+          log()  { printf '[openclaw] %s\n' "$*"; }
+          warn() { printf '[openclaw][warn] %s\n' "$*" >&2; }
+          die()  { printf '[openclaw][error] %s\n' "$*" >&2; exit 1; }
+
+          require_root() {
+            [ "$(id -u)" -eq 0 ] || die "run this command as root"
+          }
+
+          require_openclaw() {
+            [ -x "$OPENCLAW_BIN" ] || die "openclaw is not installed at $OPENCLAW_BIN"
+          }
+
+          read_token() {
+            [ -r "$ENV_FILE" ] || return 0
+            sed -n 's/^OPENCLAW_GATEWAY_TOKEN=//p' "$ENV_FILE" | tail -n 1
+          }
+
+          # Run an OpenClaw CLI command as the service account with the exact state and
+          # config paths used by openclaw-gateway.service.
+          as_openclaw() {
+            local token
+            token="$(read_token)"
+            local -a env_args=(
+              "HOME=$OPENCLAW_HOME"
+              "USER=$OPENCLAW_USER"
+              "LOGNAME=$OPENCLAW_USER"
+              "PATH=$PATH"
+              "LANG=C.UTF-8"
+              "OPENCLAW_STATE_DIR=$STATE_DIR"
+              "OPENCLAW_CONFIG_PATH=$CONFIG_FILE"
+              "OPENCLAW_SERVICE_REPAIR_POLICY=external"
+              "OPENCLAW_SUPERVISOR_MODE=external"
+              "OPENCLAW_GATEWAY_PORT=$PORT"
+            )
+            [ -n "${TERM:-}" ] && env_args+=("TERM=$TERM")
+            [ -n "$token" ] && env_args+=("OPENCLAW_GATEWAY_TOKEN=$token")
+            runuser -u "$OPENCLAW_USER" -- env -i "${env_args[@]}" "$@"
+          }
+
+          installed_version() {
+            local pkg
+            pkg="$(npm root -g 2>/dev/null)/openclaw/package.json"
+            if [ -r "$pkg" ]; then
+              jq -r '.version // "unknown"' "$pkg"
+            else
+              printf 'unknown\n'
+            fi
+          }
+
+          get_ipv4() {
+            local iface="${OPENCLAW_NET_IFACE:-eth0}" value=""
+            value="$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null |
+              awk '{print $4}' | cut -d/ -f1 | head -n 1 || true)"
+            if [ -z "$value" ]; then
+              value="$(ip -4 -o addr show scope global 2>/dev/null |
+                awk '{print $4}' | cut -d/ -f1 | head -n 1 || true)"
+            fi
+            if [ -z "$value" ]; then
+              value="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+            fi
+            printf '%s' "$value"
+          }
+
+          ensure_state() {
+            install -d -o "$OPENCLAW_USER" -g "$OPENCLAW_USER" -m 0700 \
+              "$STATE_DIR" "$STATE_DIR/workspace" "$BACKUP_DIR"
+            [ -f "$CONFIG_FILE" ] || die "missing config: $CONFIG_FILE"
+            chown "$OPENCLAW_USER:$OPENCLAW_USER" "$CONFIG_FILE"
+            chmod 600 "$CONFIG_FILE"
+          }
+
+          wait_ready() {
+            local timeout="${1:-180}" i code
+            for ((i = 1; i <= timeout; i++)); do
+              code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 \
+                "http://127.0.0.1:$PORT/readyz" 2>/dev/null || true)"
+              [ "$code" = "200" ] && return 0
+              sleep 1
+            done
+            return 1
+          }
+
+          refresh_info() {
+            local ipv4 token version
+            ipv4="$(get_ipv4)"
+            token="$(read_token)"
+            version="$(installed_version)"
+
+            {
+              echo "============================================================"
+              echo " OpenClaw Debian 13 LXC"
+              echo "============================================================"
+              echo "OpenClaw : $version"
+              echo "Node.js  : $(node --version 2>/dev/null || echo unknown)"
+              echo
+              echo "Control UI:"
+              if [ -n "$ipv4" ]; then
+                echo "  http://$ipv4:$PORT"
+              else
+                echo "  no global IPv4 detected (configure the container network)"
+              fi
+              echo
+              echo "Gateway token:"
+              echo "  ${token:-not generated yet (run: openclaw-manager firstboot)}"
+              echo
+              echo "First browser login:"
+              echo "  1. Open the Control UI and enter the token above."
+              echo "  2. If the browser asks for pairing, run: openclaw-devices list"
+              echo "  3. Approve the request: openclaw-devices approve <REQUEST_ID>"
+              echo "     On this host you can also run openclaw-dashboard for a one-time"
+              echo "     owner pairing URL (valid for 10 minutes)."
+              echo
+              echo "Common commands:"
+              echo "  openclaw-configure   configure models and API keys"
+              echo "  openclaw-status      service, probes, config and recent logs"
+              echo "  openclaw-logs        follow Gateway logs"
+              echo "  openclaw-restart     restart and wait for readiness"
+              echo "  openclaw-update      update OpenClaw (verified backup first)"
+              echo "  openclaw-policy      inspect or change exec permission mode"
+              echo
+              echo "State directory: $STATE_DIR"
+              echo "Workspace:       $STATE_DIR/workspace"
+              echo "============================================================"
+            } >"$INFO_FILE"
+
+            chown root:root "$INFO_FILE"
+            chmod 600 "$INFO_FILE"
+          }
+
+          firstboot() {
+            local token
+            log "first boot initialization"
+            ensure_state
+
+            token="$(read_token)"
+            if [ -z "$token" ]; then
+              token="$(openssl rand -hex 32)"
+              printf 'OPENCLAW_GATEWAY_TOKEN=%s\n' "$token" >"$ENV_FILE"
+              chown "$OPENCLAW_USER:$OPENCLAW_USER" "$ENV_FILE"
+              chmod 600 "$ENV_FILE"
+              log "generated a 256-bit Gateway token in $ENV_FILE"
+            fi
+
+            chown -R "$OPENCLAW_USER:$OPENCLAW_USER" "$STATE_DIR"
+            chmod 700 "$STATE_DIR" "$STATE_DIR/workspace"
+            chmod 600 "$CONFIG_FILE" "$ENV_FILE"
+
+            as_openclaw "$OPENCLAW_BIN" config validate ||
+              die "config validation failed; fix $CONFIG_FILE before starting the Gateway"
+
+            touch "$MARKER_FILE"
+            chown "$OPENCLAW_USER:$OPENCLAW_USER" "$MARKER_FILE"
+            chmod 600 "$MARKER_FILE"
+
+            refresh_info
+            log "first boot initialization complete"
+          }
+
+          show_info() {
+            refresh_info
+            cat "$INFO_FILE"
+          }
+
+          show_status() {
+            echo "============================================================"
+            echo " Versions"
+            echo "============================================================"
+            [ -r "$BUILD_INFO_FILE" ] && jq . "$BUILD_INFO_FILE" || true
+            echo "openclaw: $(installed_version)"
+            echo "node:     $(node --version 2>/dev/null || echo unknown)"
+            echo "npm:      $(npm --version 2>/dev/null || echo unknown)"
+
+            echo
+            echo "============================================================"
+            echo " Service"
+            echo "============================================================"
+            systemctl status "$UNIT" --no-pager || true
+            systemctl show "$UNIT" --no-pager \
+              -p ActiveState -p SubState -p Result -p NRestarts \
+              -p ExecMainStatus -p Restart -p RestartUSec || true
+
+            echo
+            echo "============================================================"
+            echo " Listener"
+            echo "============================================================"
+            ss -lntp "sport = :$PORT" 2>/dev/null || true
+
+            echo
+            echo "============================================================"
+            echo " Probes (unauthenticated, loopback)"
+            echo "============================================================"
+            printf 'healthz  '; curl -sS --max-time 5 "http://127.0.0.1:$PORT/healthz" || true; echo
+            printf 'startupz '; curl -sS --max-time 5 "http://127.0.0.1:$PORT/startupz" || true; echo
+            printf 'readyz   '; curl -sS --max-time 5 "http://127.0.0.1:$PORT/readyz" || true; echo
+
+            echo
+            echo "============================================================"
+            echo " Config summary"
+            echo "============================================================"
+            jq '{
+              gateway: {
+                mode: .gateway.mode,
+                port: .gateway.port,
+                bind: .gateway.bind,
+                authMode: .gateway.auth.mode,
+                controlUi: .gateway.controlUi
+              },
+              tools: .tools,
+              workspace: .agents.defaults.workspace,
+              model: .agents.defaults.model
+            }' "$CONFIG_FILE" 2>/dev/null || true
+
+            echo
+            echo "============================================================"
+            echo " Recent logs"
+            echo "============================================================"
+            journalctl -u "$UNIT" -n 40 --no-pager || true
+          }
+
+          restart_gateway() {
+            systemctl daemon-reload
+            systemctl reset-failed "$UNIT" 2>/dev/null || true
+            systemctl restart "$UNIT"
+            if wait_ready 180; then
+              log "Gateway is ready"
+            else
+              warn "Gateway did not become ready in 180s"
+              journalctl -u "$UNIT" -n 60 --no-pager || true
+              return 1
+            fi
+          }
+
+          npm_allows_scripts_flag() {
+            local v major minor
+            v="$(npm --version)"
+            major="${v%%.*}"
+            v="${v#*.}"
+            minor="${v%%.*}"
+            [ "$major" -ge 12 ] || { [ "$major" -eq 11 ] && [ "$minor" -ge 16 ]; }
+          }
+
+          npm_install_openclaw() {
+            local version="$1"
+            if npm_allows_scripts_flag; then
+              npm install -g "openclaw@$version" --allow-scripts=openclaw
+            else
+              npm install -g "openclaw@$version"
+            fi
+          }
+
+          update_openclaw() {
+            local target="${1:-latest}"
+            local current before
+            require_openclaw
+
+            current="$(installed_version)"
+            if [ "$target" = "latest" ]; then
+              target="$(npm view openclaw version)"
+            fi
+            [ -n "$target" ] || die "could not resolve the target OpenClaw version"
+            if [[ ! "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              die "invalid OpenClaw version: $target"
+            fi
+            if [ "$target" = "$current" ]; then
+              log "OpenClaw $current is already installed"
+              return 0
+            fi
+
+            log "updating OpenClaw $current -> $target"
+            install -d -o "$OPENCLAW_USER" -g "$OPENCLAW_USER" -m 0700 "$BACKUP_DIR"
+
+            log "creating a verified state backup in $BACKUP_DIR"
+            as_openclaw "$OPENCLAW_BIN" backup create --output "$BACKUP_DIR" --verify \
+              --keep-daily 7 --keep-weekly 4 ||
+              die "backup failed; update aborted"
+
+            before="$current"
+            systemctl stop "$UNIT"
+
+            if ! npm_install_openclaw "$target"; then
+              warn "npm install failed; restarting the previous version"
+              systemctl start "$UNIT" || true
+              die "OpenClaw update failed during npm install"
+            fi
+
+            if ! as_openclaw "$OPENCLAW_BIN" doctor --fix --non-interactive; then
+              warn "doctor --fix reported issues; see 'openclaw-doctor --json'"
+            fi
+
+            systemctl daemon-reload
+            systemctl start "$UNIT"
+
+            if wait_ready 180; then
+              refresh_info
+              log "OpenClaw updated to $target and the Gateway is ready"
+              return 0
+            fi
+
+            warn "the new version did not become ready; attempting to restore $before"
+            journalctl -u "$UNIT" -n 80 --no-pager || true
+            systemctl stop "$UNIT" || true
+            if npm_install_openclaw "$before"; then
+              systemctl start "$UNIT" || true
+              if wait_ready 120; then
+                warn "rolled back to $before; inspect the failed update before retrying"
+              else
+                warn "rollback to $before did not become ready"
+              fi
+            else
+              warn "rollback install failed; the Gateway may need manual repair"
+            fi
+            return 1
+          }
+
+          show_policy() {
+            as_openclaw "$OPENCLAW_BIN" exec-policy show
+          }
+
+          set_policy() {
+            local mode="$1"
+            case "$mode" in
+              deny|allowlist|ask|auto|full) ;;
+              *) die "mode must be one of: deny allowlist ask auto full" ;;
+            esac
+
+            as_openclaw "$OPENCLAW_BIN" config set tools.exec.mode "$mode"
+
+            # The official no-prompt posture requires the host approvals document to
+            # agree with tools.exec.mode. See docs.openclaw.ai/tools/permission-modes.
+            if [ "$mode" = "full" ]; then
+              printf '%s\n' \
+                '{ version: 1, defaults: { security: "full", ask: "off", askFallback: "full" } }' |
+                as_openclaw "$OPENCLAW_BIN" approvals set --gateway --stdin ||
+                die "failed to update Gateway-host approvals"
+            fi
+
+            restart_gateway
+            log "exec permission mode set to $mode"
+          }
+
+          show_dashboard() {
+            local out="" url ip
+            for _ in 1 2 3; do
+              if out="$(as_openclaw "$OPENCLAW_BIN" dashboard --json 2>/dev/null)"; then
+                break
+              fi
+              out=""
+              sleep 2
+            done
+            [ -n "$out" ] || die "dashboard handoff failed; is the Gateway running?"
+            url="$(printf '%s\n' "$out" | jq -r '.browserUrl // .url // empty')"
+            [ -n "$url" ] || die "the Gateway did not return a dashboard URL"
+
+            # The docs note that same-host launches use loopback for lan/wildcard binds.
+            # Rewrite the base address and the gatewayUrl fragment value to the current
+            # container address so the one-time owner handoff also works from a remote
+            # LAN browser. The bootstrap fragment is otherwise preserved.
+            ip="$(get_ipv4)"
+            if [ -n "$ip" ]; then
+              url="${url//127.0.0.1/$ip}"
+              url="${url//localhost/$ip}"
+              url="${url//\[::1\]/$ip}"
+            fi
+
+            printf '%s\n' "$url"
+            echo
+            echo "Open this one-time owner URL within 10 minutes in the browser you want"
+            echo "to pair. Treat it as a credential: it contains a bootstrap token."
+            echo "If the browser is already paired, use 'openclaw-devices list' and"
+            echo "'openclaw-devices approve <REQUEST_ID>' instead."
+          }
+
+          # -----------------------------------------------------------------------------
+          # Build-time helpers. These are used by the GitHub Actions workflow only.
+          # -----------------------------------------------------------------------------
+
+          # Remove every instance-specific byte before the rootfs is packed: the token,
+          # the first-boot marker, SQLite state, device identities, logs and backups.
+          # The shipped tree keeps only openclaw.json and an empty workspace.
+          template_reset() {
+            local tmp
+            [ -s "$CONFIG_FILE" ] || die "missing config: $CONFIG_FILE"
+
+            log "removing instance state from the template"
+            tmp="$(mktemp /tmp/openclaw-config.XXXXXX)"
+            cp "$CONFIG_FILE" "$tmp"
+            chmod 600 "$tmp"
+
+            rm -rf "$STATE_DIR" "$BACKUP_DIR"
+            install -d -o "$OPENCLAW_USER" -g "$OPENCLAW_USER" -m 0700 \
+              "$STATE_DIR" "$STATE_DIR/workspace"
+
+            mv "$tmp" "$CONFIG_FILE"
+            chown "$OPENCLAW_USER:$OPENCLAW_USER" "$CONFIG_FILE"
+            chmod 600 "$CONFIG_FILE"
+            rm -f "$INFO_FILE"
+
+            log "template state reset complete"
+          }
+
+          smoke_pid=""
+          smoke_dir=""
+
+          smoke_cleanup() {
+            if [ -n "${smoke_pid:-}" ]; then
+              kill -TERM -- "-$smoke_pid" 2>/dev/null ||
+                kill -TERM "$smoke_pid" 2>/dev/null || true
+              for _ in $(seq 1 30); do
+                kill -0 "$smoke_pid" 2>/dev/null || break
+                sleep 1
+              done
+              kill -KILL -- "-$smoke_pid" 2>/dev/null || true
+              kill -KILL "$smoke_pid" 2>/dev/null || true
+              wait "$smoke_pid" 2>/dev/null || true
+              smoke_pid=""
+            fi
+            if [ -n "${smoke_dir:-}" ] && [ -d "$smoke_dir" ]; then
+              rm -rf -- "$smoke_dir"
+              smoke_dir=""
+            fi
+          }
+
+          smoke_probe() {
+            local path="$1" timeout="$2" code=""
+            local -i i
+            for ((i = 1; i <= timeout; i++)); do
+              if ! kill -0 "$smoke_pid" 2>/dev/null; then
+                warn "Gateway exited during smoke test"
+                return 1
+              fi
+              code="$(curl -sS -o "$smoke_dir/body.json" -w '%{http_code}' \
+                --connect-timeout 2 --max-time 5 \
+                "http://127.0.0.1:$PORT$path" 2>/dev/null || true)"
+              [ "$code" = "200" ] && return 0
+              sleep 1
+            done
+            return 1
+          }
+
+          # Start the Gateway against an isolated copy of the shipped config and require
+          # the documented liveness, startup and readiness probes. No build-time database
+          # or device identity can leak into the template because the state directory is
+          # temporary and is deleted afterwards.
+          smoke_test() {
+            local token
+            require_root
+            require_openclaw
+            [ -s "$CONFIG_FILE" ] || die "missing config: $CONFIG_FILE"
+
+            if ss -H -lnt "sport = :$PORT" 2>/dev/null | grep -q .; then
+              die "port $PORT is already in use"
+            fi
+
+            token="$(openssl rand -hex 32)"
+            smoke_dir="$(mktemp -d /tmp/openclaw-smoke.XXXXXX)"
+            chown "$OPENCLAW_USER:$OPENCLAW_USER" "$smoke_dir"
+            chmod 700 "$smoke_dir"
+            cp "$CONFIG_FILE" "$smoke_dir/openclaw.json"
+            chown "$OPENCLAW_USER:$OPENCLAW_USER" "$smoke_dir/openclaw.json"
+
+            trap smoke_cleanup EXIT INT TERM
+
+            log "starting an isolated Gateway on 127.0.0.1:$PORT"
+            setsid runuser -u "$OPENCLAW_USER" -- env -i \
+              "HOME=$OPENCLAW_HOME" \
+              "USER=$OPENCLAW_USER" \
+              "LOGNAME=$OPENCLAW_USER" \
+              "PATH=$PATH" \
+              "LANG=C.UTF-8" \
+              "OPENCLAW_STATE_DIR=$smoke_dir" \
+              "OPENCLAW_CONFIG_PATH=$smoke_dir/openclaw.json" \
+              "OPENCLAW_SERVICE_REPAIR_POLICY=external" \
+              "OPENCLAW_SUPERVISOR_MODE=external" \
+              "OPENCLAW_GATEWAY_TOKEN=$token" \
+              "$OPENCLAW_BIN" gateway --port "$PORT" --bind loopback \
+              >"$smoke_dir/gateway.log" 2>&1 &
+            smoke_pid=$!
+
+            if ! smoke_probe /healthz 90; then
+              tail -n 80 "$smoke_dir/gateway.log" >&2 || true
+              die "smoke test failed: /healthz did not return 200"
+            fi
+            log "/healthz live"
+
+            if ! smoke_probe /startupz 120; then
+              tail -n 80 "$smoke_dir/gateway.log" >&2 || true
+              die "smoke test failed: /startupz did not return 200"
+            fi
+            log "/startupz started"
+
+            if ! smoke_probe /readyz 180; then
+              tail -n 80 "$smoke_dir/gateway.log" >&2 || true
+              die "smoke test failed: /readyz did not return 200"
+            fi
+            log "/readyz ready"
+
+            sleep 5
+            if ! kill -0 "$smoke_pid" 2>/dev/null; then
+              tail -n 80 "$smoke_dir/gateway.log" >&2 || true
+              die "smoke test failed: Gateway exited after readiness"
+            fi
+            if ! ss -H -lnt "sport = :$PORT" 2>/dev/null | grep -q .; then
+              tail -n 80 "$smoke_dir/gateway.log" >&2 || true
+              die "smoke test failed: Gateway stopped listening"
+            fi
+
+            smoke_cleanup
+            trap - EXIT INT TERM
+            log "smoke test passed"
+          }
+
+          usage() {
+            cat <<'USAGE'
+          OpenClaw Debian 13 LXC manager
+
+          Usage: openclaw-manager <command> [args]
+
+            firstboot              initialize token/config marker (systemd oneshot)
+            info                   show URL, token and common commands
+            status                 versions, service, probes, config and logs
+            token                  print the Gateway token
+            start | stop | restart manage openclaw-gateway.service
+            logs                   follow Gateway journal output
+            dashboard              print a one-time Control UI pairing URL
+            devices [args...]      run 'openclaw devices' (list/approve/revoke)
+            configure              run 'openclaw configure' interactively
+            onboard                run 'openclaw onboard' interactively
+            doctor [args...]       run 'openclaw doctor' as the service account
+            policy [mode]          show or set exec mode (deny|allowlist|ask|auto|full)
+            backup                 create a verified state backup
+            update [version]       update OpenClaw (latest if omitted), with rollback
+            version                print the installed OpenClaw version
+            template-reset         build only: remove instance state before packing
+            smoke-test             build only: isolated Gateway probe test
+          USAGE
+          }
+
+          main() {
+            local cmd="${1:-help}"
+            [ $# -gt 0 ] && shift
+
+            case "$cmd" in
+              firstboot)
+                require_root
+                firstboot
+                ;;
+              info)
+                require_root
+                show_info
+                ;;
+              status)
+                require_root
+                show_status
+                ;;
+              token)
+                require_root
+                read_token
+                echo
+                ;;
+              start)
+                require_root
+                systemctl start "$UNIT"
+                wait_ready 180 || die "Gateway did not become ready"
+                log "Gateway started"
+                ;;
+              stop)
+                require_root
+                systemctl stop "$UNIT"
+                log "Gateway stopped"
+                ;;
+              restart)
+                require_root
+                restart_gateway
+                ;;
+              logs)
+                require_root
+                exec journalctl -u "$UNIT" -n 100 -f
+                ;;
+              dashboard)
+                require_root
+                show_dashboard
+                ;;
+              devices)
+                require_root
+                as_openclaw "$OPENCLAW_BIN" devices "$@"
+                ;;
+              configure)
+                require_root
+                as_openclaw "$OPENCLAW_BIN" configure "$@"
+                ;;
+              onboard)
+                require_root
+                as_openclaw "$OPENCLAW_BIN" onboard "$@"
+                ;;
+              doctor)
+                require_root
+                as_openclaw "$OPENCLAW_BIN" doctor "$@"
+                ;;
+              policy)
+                require_root
+                if [ $# -eq 0 ]; then
+                  show_policy
+                else
+                  set_policy "$1"
+                fi
+                ;;
+              backup)
+                require_root
+                install -d -o "$OPENCLAW_USER" -g "$OPENCLAW_USER" -m 0700 "$BACKUP_DIR"
+                as_openclaw "$OPENCLAW_BIN" backup create --output "$BACKUP_DIR" --verify \
+                  --keep-daily 7 --keep-weekly 4
+                ;;
+              update)
+                require_root
+                update_openclaw "${1:-latest}"
+                ;;
+              version)
+                installed_version
+                ;;
+              template-reset)
+                require_root
+                template_reset
+                ;;
+              smoke-test)
+                require_root
+                smoke_test
+                ;;
+              help|-h|--help)
+                usage
+                ;;
+              *)
+                usage
+                exit 1
+                ;;
+            esac
+          }
+
+          main "$@"
+          MANAGER_EOF
+
+          cat >"$INSTALL_SCRIPT" <<'INSTALL_EOF'
+          #!/usr/bin/env bash
+          # =============================================================================
+          # Inside-the-chroot installer for the OpenClaw Debian 13 LXC template.
+          #
+          # Called by the GitHub Actions build as:
+          #   OPENCLAW_VERSION=<exact version> TEMPLATE_VERSION=<version> \
+          #     bash /root/install-openclaw.sh
+          #
+          # Everything here runs as root inside a debootstrap(8) trixie rootfs. The
+          # Gateway itself is configured to run as the unprivileged "openclaw" account.
+          # =============================================================================
+          set -Eeuo pipefail
+
+          export DEBIAN_FRONTEND=noninteractive
+          export HOME=/root
+          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+          OPENCLAW_VERSION="${OPENCLAW_VERSION:?OPENCLAW_VERSION is required}"
+          TEMPLATE_VERSION="${TEMPLATE_VERSION:-unknown}"
+          OPENCLAW_USER="openclaw"
+          OPENCLAW_HOME="/home/openclaw"
+          STATE_DIR="$OPENCLAW_HOME/.openclaw"
+          CONFIG_FILE="$STATE_DIR/openclaw.json"
+
+          APT_OPTS=(
+            -y
+            -o Dpkg::Options::=--force-confdef
+            -o Dpkg::Options::=--force-confold
+          )
+
+          log()  { printf '[install] %s\n' "$*"; }
+          die()  { printf '[install][error] %s\n' "$*" >&2; exit 1; }
+
+          log "Debian release: $(. /etc/os-release && printf '%s %s' "$NAME" "$VERSION_ID")"
+
+          # -----------------------------------------------------------------------------
+          # APT sources: Debian 13 (trixie) stable, point releases and security.
+          # -----------------------------------------------------------------------------
+          cat >/etc/apt/sources.list <<'SOURCES'
+          deb https://deb.debian.org/debian trixie main
+          deb https://deb.debian.org/debian trixie-updates main
+          deb https://security.debian.org/debian-security trixie-security main
+          SOURCES
+
+          cat >/etc/apt/apt.conf.d/99openclaw <<'APTCONF'
+          Acquire::Retries "5";
+          APT::Install-Recommends "false";
+          APT::Install-Suggests "false";
+          APTCONF
+
+          log "installing base packages"
+          apt-get update
+          apt-get "${APT_OPTS[@]}" upgrade
+          apt-get "${APT_OPTS[@]}" install --no-install-recommends \
+            systemd \
+            systemd-sysv \
+            dbus \
+            ifupdown \
+            isc-dhcp-client \
+            iproute2 \
+            iputils-ping \
+            netbase \
+            ca-certificates \
+            curl \
+            gnupg \
+            git \
+            jq \
+            openssl \
+            xz-utils \
+            zstd \
+            tar \
+            gzip \
+            file \
+            unzip \
+            less \
+            nano \
+            bash-completion \
+            procps \
+            psmisc \
+            util-linux \
+            locales \
+            tzdata
+
+          # -----------------------------------------------------------------------------
+          # Node.js: official NodeSource 24.x LTS repository, as documented at
+          # https://docs.openclaw.ai/install/node (Ubuntu/Debian tab).
+          # -----------------------------------------------------------------------------
+          log "installing Node.js 24 LTS from NodeSource"
+          curl -fsSL https://deb.nodesource.com/setup_24.x -o /tmp/nodesource_setup.sh
+          if ! bash /tmp/nodesource_setup.sh >/tmp/nodesource-setup.log 2>&1; then
+            tail -n 40 /tmp/nodesource-setup.log >&2
+            die "NodeSource repository setup failed"
+          fi
+          apt-get "${APT_OPTS[@]}" install nodejs
+
+          NODE_VERSION="$(node --version)"
+          NPM_VERSION="$(npm --version)"
+          log "Node.js $NODE_VERSION / npm $NPM_VERSION"
+
+          # OpenClaw 2026.11.x engines: >=24.16.0 <25 || >=26.1.0.
+          # Node 24.22.1+ / 26.12.1+ are the security-patched recommendation from the
+          # official Node compatibility table. Refuse anything older.
+          node -e '
+            const [major, minor, patch] = process.versions.node.split(".").map(Number);
+            const safe24 = major === 24 && (minor > 22 || (minor === 22 && patch >= 1));
+            const safe26 = major === 26 && (minor > 12 || (minor === 12 && patch >= 1));
+            const future = major > 26;
+            if (!(safe24 || safe26 || future)) {
+              console.error(`unsupported Node.js ${process.versions.node}; need 24.22.1+, 26.12.1+, or newer`);
+              process.exit(1);
+            }
+          ' || die "Node.js version does not meet the OpenClaw security recommendation"
+
+          # -----------------------------------------------------------------------------
+          # OpenClaw: npm global install, exactly as documented for npm 11.16+/12.
+          # npm 11.15 and earlier do not understand --allow-scripts and must omit it.
+          # -----------------------------------------------------------------------------
+          if [ "$OPENCLAW_VERSION" = "latest" ]; then
+            OPENCLAW_VERSION="$(npm view openclaw version)"
+          fi
+          [[ "$OPENCLAW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] ||
+            die "invalid OpenClaw version: $OPENCLAW_VERSION"
+
+          NPM_MAJOR="${NPM_VERSION%%.*}"
+          NPM_REST="${NPM_VERSION#*.}"
+          NPM_MINOR="${NPM_REST%%.*}"
+
+          log "installing openclaw@$OPENCLAW_VERSION"
+          if [ "$NPM_MAJOR" -ge 12 ] || { [ "$NPM_MAJOR" -eq 11 ] && [ "$NPM_MINOR" -ge 16 ]; }; then
+            if ! npm install -g "openclaw@$OPENCLAW_VERSION" --allow-scripts=openclaw \
+              >/tmp/openclaw-npm-install.log 2>&1; then
+              tail -n 80 /tmp/openclaw-npm-install.log >&2
+              die "npm install failed"
+            fi
+          else
+            if ! npm install -g "openclaw@$OPENCLAW_VERSION" \
+              >/tmp/openclaw-npm-install.log 2>&1; then
+              tail -n 80 /tmp/openclaw-npm-install.log >&2
+              die "npm install failed"
+            fi
+          fi
+
+          OPENCLAW_ROOT="$(npm root -g)/openclaw"
+          [ -r "$OPENCLAW_ROOT/package.json" ] || die "openclaw package is missing after install"
+          INSTALLED_VERSION="$(jq -r '.version' "$OPENCLAW_ROOT/package.json")"
+          [ "$INSTALLED_VERSION" = "$OPENCLAW_VERSION" ] ||
+            die "installed version $INSTALLED_VERSION does not match $OPENCLAW_VERSION"
+          [ -x /usr/bin/openclaw ] || die "/usr/bin/openclaw was not created"
+
+          log "openclaw $(/usr/bin/openclaw --version | head -n 1)"
+
+          # -----------------------------------------------------------------------------
+          # Service account and state layout. The Gateway must not run as root.
+          # -----------------------------------------------------------------------------
+          if ! id "$OPENCLAW_USER" >/dev/null 2>&1; then
+            useradd --create-home --home-dir "$OPENCLAW_HOME" --shell /bin/bash \
+              --user-group "$OPENCLAW_USER"
+          fi
+
+          install -d -o "$OPENCLAW_USER" -g "$OPENCLAW_USER" -m 0700 \
+            "$STATE_DIR" "$STATE_DIR/workspace"
+
+          # -----------------------------------------------------------------------------
+          # Config. Only documented keys are used:
+          #   gateway.mode=local, bind=lan, auth.mode=token
+          #   gateway.auth.token references the environment variable, so no secret is
+          #   stored in the template or in openclaw.json.
+          #   agents.defaults.workspace matches the documented minimal config.
+          #   tools.profile=full mirrors local onboarding; tools.exec.mode=auto is the
+          #   documented recommended default for host exec.
+          # -----------------------------------------------------------------------------
+          cat >"$CONFIG_FILE" <<'JSON'
+          {
+            "gateway": {
+              "mode": "local",
+              "port": 18789,
+              "bind": "lan",
+              "auth": {
+                "mode": "token",
+                "token": "${OPENCLAW_GATEWAY_TOKEN}"
+              }
+            },
+            "agents": {
+              "defaults": {
+                "workspace": "~/.openclaw/workspace"
+              }
+            },
+            "tools": {
+              "profile": "full",
+              "exec": {
+                "host": "gateway",
+                "mode": "auto"
+              }
+            }
+          }
+          JSON
+
+          chown "$OPENCLAW_USER:$OPENCLAW_USER" "$CONFIG_FILE"
+          chmod 600 "$CONFIG_FILE"
+
+          # -----------------------------------------------------------------------------
+          # systemd system unit. This follows the official Linux system-service variant:
+          # User= is the non-root state owner, and the restart/stop policy matches the
+          # documented sample unit (StartLimit*, Restart, RestartPreventExitStatus=78,
+          # TimeoutStopSec=330, SuccessExitStatus, OOMPolicy, KillMode, Delegate).
+          # OPENCLAW_SUPERVISOR_MODE and OPENCLAW_SERVICE_REPAIR_POLICY tell the CLI that
+          # this hand-written system unit owns the lifecycle.
+          # -----------------------------------------------------------------------------
+          cat >/etc/systemd/system/openclaw-gateway.service <<'UNIT'
+          [Unit]
+          Description=OpenClaw Gateway
+          Documentation=https://docs.openclaw.ai/gateway
+          After=network-online.target openclaw-firstboot.service
+          Wants=network-online.target
+          Requires=openclaw-firstboot.service
+          StartLimitBurst=10
+          StartLimitIntervalSec=300
+
+          [Service]
+          Type=simple
+          User=openclaw
+          Group=openclaw
+          WorkingDirectory=/home/openclaw
+          Environment=HOME=/home/openclaw
+          Environment=OPENCLAW_STATE_DIR=/home/openclaw/.openclaw
+          Environment=OPENCLAW_CONFIG_PATH=/home/openclaw/.openclaw/openclaw.json
+          Environment=OPENCLAW_SERVICE_REPAIR_POLICY=external
+          Environment=OPENCLAW_SUPERVISOR_MODE=external
+          Environment=OPENCLAW_GATEWAY_PORT=18789
+          EnvironmentFile=/home/openclaw/.openclaw/.env
+          ExecStart=/usr/bin/openclaw gateway --port 18789
+          Restart=always
+          RestartSec=5
+          RestartPreventExitStatus=78
+          TimeoutStartSec=30
+          TimeoutStopSec=330
+          SuccessExitStatus=0 143
+          OOMPolicy=continue
+          KillMode=mixed
+          Delegate=yes
+          DelegateSubgroup=gateway
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          cat >/etc/systemd/system/openclaw-firstboot.service <<'UNIT'
+          [Unit]
+          Description=OpenClaw first boot initialization
+          Documentation=https://docs.openclaw.ai/install
+          After=local-fs.target
+          Before=openclaw-gateway.service
+          ConditionPathExists=!/home/openclaw/.openclaw/.initialized
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/openclaw-manager firstboot
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          chmod 644 /etc/systemd/system/openclaw-gateway.service \
+            /etc/systemd/system/openclaw-firstboot.service
+
+          # -----------------------------------------------------------------------------
+          # Manager script and operator shortcuts.
+          # -----------------------------------------------------------------------------
+          install -o root -g root -m 0755 /root/openclaw-manager /usr/local/sbin/openclaw-manager
+          ln -sfn /usr/local/sbin/openclaw-manager /usr/local/sbin/openclaw-lxc-manager
+
+          for name in info status token start stop restart logs dashboard devices \
+            configure onboard doctor policy backup update version; do
+            ln -sfn /usr/local/sbin/openclaw-manager "/usr/local/bin/openclaw-$name"
+          done
+
+          # -----------------------------------------------------------------------------
+          # Container identity, network defaults and login banner.
+          # Proxmox overwrites /etc/network/interfaces and /etc/resolv.conf per CT.
+          # -----------------------------------------------------------------------------
+          printf 'openclaw\n' >/etc/hostname
+          cat >/etc/hosts <<'HOSTS'
+          127.0.0.1 localhost openclaw
+          ::1 localhost ip6-localhost ip6-loopback
+          ff02::1 ip6-allnodes
+          ff02::2 ip6-allrouters
+          HOSTS
+
+          cat >/etc/network/interfaces <<'NETWORK'
+          auto lo
+          iface lo inet loopback
+
+          auto eth0
+          iface eth0 inet dhcp
+          NETWORK
+
+          cat >/etc/motd <<'MOTD'
+          OpenClaw Debian 13 LXC
+            openclaw-info       access URL and Gateway token
+            openclaw-status     service, probes and recent logs
+            openclaw-configure  configure models and API keys
+            openclaw-update     update OpenClaw (backup + rollback)
+          MOTD
+          chmod 644 /etc/motd
+
+          printf 'LANG=C.UTF-8\n' >/etc/default/locale
+          ln -sf /usr/share/zoneinfo/UTC /etc/localtime
+          printf 'UTC\n' >/etc/timezone
+
+          # -----------------------------------------------------------------------------
+          # Build metadata (no secrets).
+          # -----------------------------------------------------------------------------
+          BUILT_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          jq -n \
+            --arg templateVersion "$TEMPLATE_VERSION" \
+            --arg openclawVersion "$INSTALLED_VERSION" \
+            --arg nodeVersion "$NODE_VERSION" \
+            --arg npmVersion "$NPM_VERSION" \
+            --arg debianRelease "13 (trixie)" \
+            --arg builtAt "$BUILT_AT" \
+            '{
+              templateVersion: $templateVersion,
+              openclawVersion: $openclawVersion,
+              nodeVersion: $nodeVersion,
+              npmVersion: $npmVersion,
+              debianRelease: $debianRelease,
+              builtAt: $builtAt
+            }' >/etc/openclaw-build-info.json
+          chmod 644 /etc/openclaw-build-info.json
+
+          # -----------------------------------------------------------------------------
+          # Remove build-only artifacts. Instance state is purged by the workflow with
+          # "openclaw-manager template-reset" after firstboot and smoke tests.
+          # -----------------------------------------------------------------------------
+          rm -f /tmp/nodesource_setup.sh /tmp/nodesource-setup.log \
+            /tmp/openclaw-npm-install.log /root/openclaw-manager
+          rm -rf /root/.npm /home/openclaw/.npm /home/openclaw/.cache
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+
+          log "install complete: openclaw $INSTALLED_VERSION, node $NODE_VERSION"
+          INSTALL_EOF
+
+          chmod 755 "$MANAGER_SCRIPT" "$INSTALL_SCRIPT"
+          bash -n "$MANAGER_SCRIPT"
+          bash -n "$INSTALL_SCRIPT"
+
+          # =============================================================================
+          # [3/10] debootstrap Debian 13 (trixie) amd64 minbase
+          # =============================================================================
+          echo "=================================================="
+          echo "[3/10] Bootstrapping Debian 13 trixie amd64"
+          echo "=================================================="
+
+          if [ -e "$ROOTFS" ]; then
+            echo "error: refusing to reuse existing rootfs: $ROOTFS" >&2
+            exit 1
+          fi
+
+          sudo debootstrap \
+            --arch=amd64 \
+            --variant=minbase \
+            --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
+            --include=systemd,systemd-sysv,dbus,ca-certificates,curl,gnupg \
+            trixie "$ROOTFS" https://deb.debian.org/debian
+
+          # =============================================================================
+          # [4/10] Prepare chroot mounts and DNS
+          # =============================================================================
+          echo "=================================================="
+          echo "[4/10] Preparing chroot"
+          echo "=================================================="
+
+          sudo install -d "$ROOTFS/dev/pts" "$ROOTFS/proc" "$ROOTFS/sys" "$ROOTFS/run"
+          sudo cp -L /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
+
+          sudo mount -t proc proc "$ROOTFS/proc"
+          sudo mount --rbind /sys "$ROOTFS/sys"
+          sudo mount --make-rslave "$ROOTFS/sys"
+          sudo mount --rbind /dev "$ROOTFS/dev"
+          sudo mount --make-rslave "$ROOTFS/dev"
+
+          # =============================================================================
+          # [5/10] Install packages, Node.js and OpenClaw inside the chroot
+          # =============================================================================
+          echo "=================================================="
+          echo "[5/10] Installing Node.js and OpenClaw"
+          echo "=================================================="
+
+          sudo install -o root -g root -m 0755 "$MANAGER_SCRIPT" "$ROOTFS/root/openclaw-manager"
+          sudo install -o root -g root -m 0755 "$INSTALL_SCRIPT" "$ROOTFS/root/install-openclaw.sh"
+
+          sudo chroot "$ROOTFS" /usr/bin/env \
+            OPENCLAW_VERSION="$OPENCLAW_VERSION" \
+            TEMPLATE_VERSION="$VERSION" \
+            /bin/bash /root/install-openclaw.sh
+
+          # =============================================================================
+          # [6/10] Enable and verify systemd units
+          # =============================================================================
+          echo "=================================================="
+          echo "[6/10] Enabling and verifying systemd units"
+          echo "=================================================="
+
+          sudo systemctl --root="$ROOTFS" enable \
+            openclaw-firstboot.service \
+            openclaw-gateway.service
+
+          sudo chroot "$ROOTFS" systemd-analyze verify \
+            /etc/systemd/system/openclaw-firstboot.service \
+            /etc/systemd/system/openclaw-gateway.service
+
+          sudo chroot "$ROOTFS" /bin/bash -n /usr/local/sbin/openclaw-manager
+
+          # =============================================================================
+          # [7/10] First-boot test, template reset and isolated smoke test
+          # =============================================================================
+          echo "=================================================="
+          echo "[7/10] Testing first boot and the Gateway"
+          echo "=================================================="
+
+          sudo chroot "$ROOTFS" /usr/local/sbin/openclaw-manager firstboot
+          sudo chroot "$ROOTFS" /usr/local/sbin/openclaw-manager template-reset
+          sudo chroot "$ROOTFS" /usr/local/sbin/openclaw-manager smoke-test
+
+          CONFIG_FILE="$ROOTFS/home/openclaw/.openclaw/openclaw.json"
+
+          sudo jq -e '
+            .gateway.mode == "local" and
+            .gateway.port == 18789 and
+            .gateway.bind == "lan" and
+            .gateway.auth.mode == "token" and
+            .gateway.auth.token == "${OPENCLAW_GATEWAY_TOKEN}" and
+            .tools.profile == "full" and
+            .tools.exec.mode == "auto"
+          ' "$CONFIG_FILE" >/dev/null
+
+          if sudo test -e "$ROOTFS/home/openclaw/.openclaw/.env" ||
+            sudo test -e "$ROOTFS/home/openclaw/.openclaw/.initialized" ||
+            sudo test -e "$ROOTFS/root/openclaw-info.txt"; then
+            echo "error: instance token, marker or info file leaked into the template" >&2
+            exit 1
+          fi
+
+          LEFTOVER="$(sudo find "$ROOTFS/home/openclaw/.openclaw" -mindepth 1 -maxdepth 1 \
+            -printf '%f\n' | grep -vE '^(openclaw\.json|workspace)$' || true)"
+          if [ -n "$LEFTOVER" ]; then
+            echo "error: unexpected state in the template: $LEFTOVER" >&2
+            exit 1
+          fi
+
+          # =============================================================================
+          # [8/10] Clean build traces, unmount, package and verify the archive
+          # =============================================================================
+          echo "=================================================="
+          echo "[8/10] Cleaning and packaging the rootfs"
+          echo "=================================================="
+
+          sudo rm -f \
+            "$ROOTFS/root/openclaw-manager" \
+            "$ROOTFS/root/install-openclaw.sh" \
+            "$ROOTFS/root/.bash_history" \
+            "$ROOTFS/root/.wget-hsts" \
+            "$ROOTFS/home/openclaw/.bash_history" \
+            "$ROOTFS/var/lib/systemd/random-seed"
+          sudo rm -rf \
+            "$ROOTFS/root/.npm" \
+            "$ROOTFS/home/openclaw/.npm" \
+            "$ROOTFS/root/.cache" \
+            "$ROOTFS/home/openclaw/.cache" \
+            "$ROOTFS/var/log/journal" \
+            "$ROOTFS/var/lib/apt/lists"/* \
+            "$ROOTFS/var/cache/apt/archives"/*
+          sudo find "$ROOTFS/tmp" -mindepth 1 -delete
+          sudo find "$ROOTFS/var/tmp" -mindepth 1 -delete
+          sudo find "$ROOTFS/var/log" -type f -exec truncate -s 0 {} \;
+          sudo rm -f "$ROOTFS/etc/ssh/ssh_host_"* 2>/dev/null || true
+
+          sudo truncate -s 0 "$ROOTFS/etc/machine-id"
+          sudo chmod 644 "$ROOTFS/etc/machine-id"
+          sudo rm -f "$ROOTFS/var/lib/dbus/machine-id"
+          sudo ln -s /etc/machine-id "$ROOTFS/var/lib/dbus/machine-id"
+
+          cleanup_mounts
+          trap - EXIT INT TERM
+
+          sudo rm -f "$ROOTFS/etc/resolv.conf"
+          printf 'nameserver 1.1.1.1\nnameserver 2606:4700:4700::1111\n' |
+            sudo tee "$ROOTFS/etc/resolv.conf" >/dev/null
+          sudo chmod 644 "$ROOTFS/etc/resolv.conf"
+
+          IMAGE_PATH="$DIST_DIR/$IMAGE_NAME"
+
+          sudo tar \
+            --numeric-owner \
+            --acls \
+            --xattrs \
+            --xattrs-include='*' \
+            --sparse \
+            -czf "$IMAGE_PATH" \
+            -C "$ROOTFS" .
+
+          (
+            cd "$DIST_DIR"
+            sha256sum "$IMAGE_NAME" >"$IMAGE_NAME.sha256"
+          )
+
+          echo "Verifying archive extraction"
+          sudo mkdir -p "$VERIFY_DIR"
+          sudo tar --numeric-owner --xattrs --xattrs-include='*' --acls \
+            -xzf "$IMAGE_PATH" -C "$VERIFY_DIR"
+
+          sudo cmp "$ROOTFS/home/openclaw/.openclaw/openclaw.json" \
+            "$VERIFY_DIR/home/openclaw/.openclaw/openclaw.json"
+          sudo cmp "$ROOTFS/etc/systemd/system/openclaw-gateway.service" \
+            "$VERIFY_DIR/etc/systemd/system/openclaw-gateway.service"
+          sudo test -x "$VERIFY_DIR/usr/local/sbin/openclaw-manager"
+          sudo test -x "$VERIFY_DIR/usr/bin/openclaw"
+          sudo test ! -e "$VERIFY_DIR/home/openclaw/.openclaw/.env"
+          sudo test ! -e "$VERIFY_DIR/home/openclaw/.openclaw/.initialized"
+          sudo grep -q '^User=openclaw$' "$VERIFY_DIR/etc/systemd/system/openclaw-gateway.service"
+
+          OPENCLAW_INSTALLED="$(sudo jq -r '.openclawVersion' "$VERIFY_DIR/etc/openclaw-build-info.json")"
+          NODE_INSTALLED="$(sudo jq -r '.nodeVersion' "$VERIFY_DIR/etc/openclaw-build-info.json")"
+
+          sudo rm -rf "$VERIFY_DIR"
+
+          # =============================================================================
+          # [9/10] Publish the GitHub release and download-verify the asset
+          # =============================================================================
+          echo "=================================================="
+          echo "[9/10] Publishing GitHub release $TAG"
+          echo "=================================================="
+
+          cat >"$DIST_DIR/README.md" <<EOF
+          # OpenClaw Debian 13 LXC template
+
+          - OpenClaw: ${OPENCLAW_INSTALLED}
+          - Node.js: ${NODE_INSTALLED} (NodeSource 24.x LTS)
+          - Debian: 13 (trixie), amd64
+          - Template version: ${VERSION}
+          - Built: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+          This is a Proxmox VE LXC template (tar.gz rootfs). The Gateway runs as the
+          unprivileged \`openclaw\` account under \`openclaw-gateway.service\`; it does not
+          run as root. No model API key or Gateway token is baked into the image. The
+          Gateway token is generated on first boot.
+
+          ## Import
+
+          \`\`\`bash
+          pct create 100 local:vztmpl/${IMAGE_NAME} \\
+            --hostname openclaw \\
+            --cores 2 --memory 4096 --swap 2048 \\
+            --rootfs local-lvm:16 \\
+            --net0 name=eth0,bridge=vmbr0,ip=dhcp \\
+            --unprivileged 1 --features nesting=1 --onboot 1
+          pct start 100
+          pct exec 100 -- openclaw-info
+          \`\`\`
+
+          Adjust the storage, bridge, network and container ID for your host. 2 GB RAM is
+          the practical minimum; 4 GB is recommended. Plan on at least 8 GB of disk, and
+          16 GB if the agent will keep large workspaces.
+
+          ## First login
+
+          \`openclaw-info\` prints the Control UI URL and the Gateway token. Open
+          \`http://<container-ip>:18789\` and enter the token. If the browser asks for
+          device pairing, approve it on the container:
+
+          \`\`\`bash
+          pct exec 100 -- openclaw-devices list
+          pct exec 100 -- openclaw-devices approve <REQUEST_ID>
+          \`\`\`
+
+          On the Gateway host, \`openclaw-dashboard\` prints a one-time owner pairing URL
+          (valid for 10 minutes).
+
+          ## Configure a model
+
+          \`\`\`bash
+          pct enter 100
+          openclaw-configure
+          openclaw-restart
+          \`\`\`
+
+          \`openclaw-configure\` runs \`openclaw configure\` as the \`openclaw\` account.
+
+          ## Operations
+
+          \`\`\`bash
+          openclaw-status              # service, probes, config and recent logs
+          openclaw-logs                # journalctl -u openclaw-gateway.service -f
+          openclaw-restart             # restart and wait for /readyz
+          openclaw-policy              # show exec permission policy
+          openclaw-policy auto         # deny|allowlist|ask|auto|full
+          openclaw-backup              # verified state backup
+          openclaw-update              # update to latest, with rollback
+          openclaw-update 2026.11.6    # update to an exact version
+          apt-get update && apt-get install --only-upgrade nodejs   # Node 24.x updates
+          \`\`\`
+
+          The unit follows the documented Linux service policy: \`Restart=always\`,
+          \`RestartPreventExitStatus=78\`, \`TimeoutStopSec=330\`, \`KillMode=mixed\`,
+          \`Delegate=yes\`, and the external-supervisor environment used by
+          \`openclaw-gateway.service\`.
+
+          ## Security notes
+
+          - The Gateway token is a full operator credential. Keep it out of URLs and
+            screenshots.
+          - Plain HTTP on the LAN is not transport-encrypted. Use Tailscale Serve or a
+            TLS reverse proxy for access outside a trusted network. When the UI is
+            served from a public hostname, set \`gateway.controlUi.allowedOrigins\` (or
+            \`gateway.publicOrigin\`) to that origin.
+          - Agent commands run as the \`openclaw\` account inside the container, not as
+            root. LXC isolation is not a security boundary against a malicious agent.
+          - The shipped config uses \`tools.exec.mode: "auto"\` (the documented recommended
+            default). Switch to \`full\` only for a trusted host with matching host
+            approvals; \`openclaw-policy full\` configures both layers.
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "$IMAGE_PATH" \
+              "$IMAGE_PATH.sha256" \
+              "$DIST_DIR/README.md" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              "$IMAGE_PATH" \
+              "$IMAGE_PATH.sha256" \
+              "$DIST_DIR/README.md" \
+              --title "OpenClaw Debian 13 LXC ${VERSION}" \
+              --notes-file "$DIST_DIR/README.md"
+          fi
+
+          mkdir -p "$DOWNLOAD_DIR"
+          gh release download "$TAG" --pattern "$IMAGE_NAME" --dir "$DOWNLOAD_DIR"
+          gh release download "$TAG" --pattern "$IMAGE_NAME.sha256" --dir "$DOWNLOAD_DIR"
+
+          (
+            cd "$DOWNLOAD_DIR"
+            sha256sum -c "$IMAGE_NAME.sha256"
+          )
+
+          # =============================================================================
+          # [10/10] Summary
+          # =============================================================================
+          echo "=================================================="
+          echo "[10/10] Build complete"
+          echo "=================================================="
+          echo "OpenClaw:        $OPENCLAW_INSTALLED"
+          echo "Node.js:         $NODE_INSTALLED"
+          echo "Template:        $IMAGE_PATH"
+          echo "Checksum:        $IMAGE_PATH.sha256"
+          echo "Release:         $TAG"
+          ls -lh "$IMAGE_PATH" "$IMAGE_PATH.sha256"
